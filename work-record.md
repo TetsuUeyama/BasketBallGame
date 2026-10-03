@@ -950,7 +950,7 @@ src/main.ts         HUD（スコア・ショットクロック・コール/対�
 ⚠️ 能力値は `attrs.ts` のテンプレート＋ランダム生成（ポジション平均±ばらつき）。実データ（過去作の選手DB等）は未導入。
 
 ### 現在の状態（すべて tsc / vite build 通過のみ。ブラウザでの実動作は一度も確認していない）
-- 起動: `npm run dev` → http://localhost:5190/（strictPort）。git 未初期化。
+- 起動: `npm run dev` → http://localhost:5190/（strictPort）。git: https://github.com/TetsuUeyama/BasketBallGame.git（main）。
 - フルコート・観戦専用・21点先取。開始はジャンプボール。
 - sim は「今の攻撃側の座標」（攻撃は常に +Z の RIM へ）。攻守交代で `Game.flipFrame` → 描画は `Game.flip` で逆に回す。
 
