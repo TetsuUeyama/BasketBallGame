@@ -41,8 +41,26 @@ export const outOfBounds = (p: V2, r = 0): boolean =>
   Math.abs(p.x) > COURT.halfW + r || Math.abs(p.z) > COURT.baseZ + r;
 
 /** ネット: リムから下へ長さ len、下の口の半径 rBottom（ボールの半径0.12よりやや小さい） */
-export const NET = { len: 0.45, rBottom: 0.075 };
+export const NET = { len: 0.45, rBottom: 0.06 };
+/** 網の細まり方の指数（1=まっすぐな円すい。小さいほど上の方から早く細くなる） */
+export const NET_TAPER = 0.6;
+
+/** 網の半径（伸びを含まない）。u = リムからの深さの割合 0（リム）..1（下の口） */
+export function netProfile(u: number): number {
+  const k = Math.pow(Math.min(1, Math.max(0, u)), NET_TAPER);
+  return COURT.rimR + (NET.rBottom - COURT.rimR) * k;
+}
+/** 網がボールに押されて広がれる量 [m]（下の口 0.06 + 0.05 はボール 0.12 より細い＝擦れて絞られながら真ん中を抜ける） */
+export const NET_STRETCH = 0.05;
+
+/** リムの面から depth [m] 下での網の半径（伸びを含む）。0..NET.len の外は -1 */
+export function netRadiusAt(depth: number): number {
+  if (depth < 0 || depth > NET.len) return -1;
+  return netProfile(depth / NET.len) + NET_STRETCH;
+}
 export const BALL_R = 0.12;
+/** ボールの質量 [kg] */
+export const BALL_MASS = 0.62;
 
 /** バックボード（前面 z=BOARD.z、厚さ depth、下端 y0 〜 上端 y1、幅 ±halfW） */
 export const BOARD = { z: 14 - 1.2, depth: 0.05, y0: 2.9, y1: 3.95, halfW: 0.9 };

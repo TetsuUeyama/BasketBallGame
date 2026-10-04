@@ -88,6 +88,14 @@ export class Stadium {
     if (s) void this.draw(slot, s);
   }
 
+  /** バックボードの帯のロゴを、揺れるボードの節に付ける（sg = 表示の +Z:+1 / −Z:−1）。親は原点・無回転の前提 */
+  attachBoardLogo(sg: 1 | -1, parent: TransformNode): void {
+    const m = this.scene.getMeshByName(`logo${sg < 0 ? "BOARD_NEGZ" : "BOARD_POSZ"}`);
+    if (!m) return;
+    m.unfreezeWorldMatrix();
+    m.parent = parent;
+  }
+
   /** どちらのチームが表示の −Z 側にベンチを持つか（＝ −Z のゴールを守るか）。変わったときだけ塗り直す */
   setSides(negZTeam: 0 | 1): void {
     if (negZTeam === this.negZTeam) return;

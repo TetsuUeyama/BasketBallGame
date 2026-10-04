@@ -36,6 +36,8 @@ export interface ReachOpt {
    * （手で届けばよいシュートのコンテストやパスカットは、空中でも手は出せるので付けない）
    */
   body?: boolean;
+  /** 評価用: この守備者がさらに遅れる時間（スティールに失敗したら、を見積もる） */
+  delay?: number;
 }
 
 /**
@@ -53,9 +55,10 @@ export function timeToReach(pl: Player, q: V2, reachR: number, o: ReachOpt = {})
       if (pl.bal.off) pen += recoverTime(pl);
       if (pl.airborne) pen += pl.airT + 0.1 + 0.3;
       else if (pl.landT > 0) pen += pl.landT * 0.8;
-      return pen;
+      return pen + pl.commitT + (o.delay ?? 0);
     }
-    return 0;
+    // 手が届く所に居ても、スティールの空振りで体が流れている間（commitT・評価用の delay）は手を出せない・跳べない
+    return o.still ? 0 : pl.commitT + (o.delay ?? 0);
   }
   const dir = norm(sub(q, from));
   const v0 = o.still ? 0 : dot(pl.v, dir);
@@ -95,7 +98,10 @@ export function timeToReach(pl: Player, q: V2, reachR: number, o: ReachOpt = {})
     if (pl.bal.off) t += recoverTime(pl);
     if (pl.airborne) t += pl.airT + 0.1 + 0.3;
     else if (pl.landT > 0) t += pl.landT * 0.8;
+    // スティールの空振りで体が流れている
+    t += pl.commitT;
   }
+  if (o.delay) t += o.delay;
   if (o.lag) t += o.lag;
   return t;
 }

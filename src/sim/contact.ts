@@ -8,9 +8,23 @@ import { Player } from "./player";
 const anchorOf = (p: Player): number =>
   p.mass * (0.6 + 0.8 * n(p.a.strength)) * (1 + 0.6 * p.stance) * p.pushBoost * (p.airborne ? 0.3 : 1) * (p.bal.off ? 0.5 : 1);
 
-/** 押す力: 筋力×体重×構え×本気度。崩れていたり跳んでいたりすると押せない */
-const pushPower = (p: Player): number =>
-  p.mass * (0.6 + 0.8 * n(p.a.strength)) * (1 + 0.4 * p.stance) * (p.bal.off ? 0.4 : 1) * (p.airborne ? 0.3 : 1);
+/** 押し込みドリブルの仕掛ける側の有利（自分から当たるタイミングを選べる）: 押す力 ×1.1 */
+export const POST_INITIATIVE = 1.1;
+
+/**
+ * 押す力: 筋力×体重×構え×本気度。崩れていたり跳んでいたりすると押せない。stance を渡せばその構えで見積もる。
+ * post = 押し込みドリブルで仕掛けている側（POST_INITIATIVE 倍）
+ */
+export const pushPower = (p: Player, stance = p.stance, post = p.postUp): number =>
+  p.mass * (0.6 + 0.8 * n(p.a.strength)) * (1 + 0.4 * stance) * (p.bal.off ? 0.4 : 1) * (p.airborne ? 0.3 : 1) * (post ? POST_INITIATIVE : 1);
+
+/**
+ * 押し合いで動く速さ [m/s]（押し勝ちの度合い net=1 のとき）。
+ * 押し込みドリブル中は 6.0: net は力の差が小さく出る（力が25%強くて net≈0.11）ので、互角＋仕掛けの有利で約0.4m/s、
+ * 力で勝てば1m/s前後になるように
+ */
+export const PUSH_SPEED = 1.1;
+export const POST_PUSH_SPEED = 6.0;
 
 /** p が向き n の方へ（相手の居る方へ）進みたい度合い（0..1） */
 function intentToward(p: Player, nx: number, nz: number): number {
@@ -88,7 +102,7 @@ export function resolveContacts(
         const Fb = pushPower(b) * b.effort * intentToward(b, -nrm.x, -nrm.z);
         if (Fa + Fb > 1) {
           const net = (Fa - Fb) / (Fa + Fb); // +: a が b を押す
-          const step = net * 1.1 * dt;
+          const step = net * (a.postUp || b.postUp ? POST_PUSH_SPEED : PUSH_SPEED) * dt;
           a.p = madd(a.p, nrm, step);
           b.p = madd(b.p, nrm, step);
           const loser = net > 0 ? b : a;

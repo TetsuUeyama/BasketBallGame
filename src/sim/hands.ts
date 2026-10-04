@@ -3,9 +3,9 @@
 // パスカット・ブロック・リバウンド・スティール・キャッチは game.ts が「手がボールに触れたか」で判定する。
 import { RIM } from "./court";
 import type { Game } from "./game";
-import { V2, clamp, closestT, dirTo, dist, lerpV, madd } from "./math";
-import { Player, V3 } from "./player";
-import { passHeight } from "./lanes";
+import { V2, angleBetween, clamp, closestT, dirTo, dist, lerpV, madd } from "./math";
+import { Player, TRUNK_MAX, TWIST_MAX, V3 } from "./player";
+import { passFrac, passHeight } from "./lanes";
 
 const v3 = (p: V2, y: number): V3 => ({ x: p.x, y, z: p.z });
 
@@ -18,11 +18,22 @@ function nearHand(pl: Player, q: V2): number {
 function both(pl: Player, t: V3): void {
   pl.hands[0].cmd = t;
   pl.hands[1].cmd = t;
-  // 腕を下ろしても届かない低さなら構えを落とし、さらに低ければ腰をかがめる
+  // 上半身を狙いの向きへひねる（下半身の向きから ±TWIST_MAX まで）
+  const dx = t.x - pl.p.x, dz = t.z - pl.p.z;
+  const hd = Math.hypot(dx, dz);
+  if (hd > 0.25) pl.twistCmd = clamp(angleBetween(pl.f, { x: dx, z: dz }), -TWIST_MAX, TWIST_MAX);
+  // 腕を下ろしても届かない低さなら構えを落とし、腰をかがめ、上半身を前へ曲げる
   const low = pl.shoulderY - pl.armLen * 0.9;
   if (t.y < low) {
+    const k = clamp((low - t.y) / 0.85, 0, 1);
     pl.stanceCmd = Math.max(pl.stanceCmd, 1);
-    pl.bendCmd = Math.max(pl.bendCmd, clamp((low - t.y) / 0.85, 0, 1));
+    pl.bendCmd = Math.max(pl.bendCmd, k);
+    pl.trunkCmd = Math.max(pl.trunkCmd, k * TRUNK_MAX);
+  }
+  // 肩より低く、腕だけでは前へ届かない距離なら、上半身を倒して前へ伸ばす
+  if (t.y < pl.shoulderY) {
+    const armOnly = pl.radius + 0.04 + pl.armLen * 0.6;
+    if (hd > armOnly) pl.trunkCmd = Math.max(pl.trunkCmd, clamp((hd - armOnly) / pl.torsoLen, 0, 1) * TRUNK_MAX * 0.75);
   }
 }
 
@@ -41,13 +52,15 @@ export function aimHands(g: Game): void {
   const h = g.holder();
 
   for (const p of g.players) { p.hands[0].cmd = null; p.hands[1].cmd = null; }
+  // 頭の向き: ふだんはボールを見る。ボールを持つ人はリング（パス・シュートで上書き）
+  for (const p of g.players) p.lookAt = p === h ? RIM : bp.p;
 
   // 少し先のボール（動いているボールへ手を出すとき）
   let ahead = B;
   if (b.k === "pass") {
     const s = Math.min(1, (b.t + 0.08) / b.T);
-    const q = lerpV(b.p0, b.p1, s);
-    ahead = v3(q, passHeight(b.style, b.h0, b.h1, s, b.L));
+    const q = lerpV(b.p0, b.p1, passFrac(s, b.L));
+    ahead = v3(q, passHeight(b.style, b.h0, b.h1, s, b.T));
   } else if (b.k === "loose") {
     ahead = { x: b.p.x + b.v.x * 0.08, y: b.h + b.vy * 0.08, z: b.p.z + b.v.z * 0.08 };
   }
@@ -56,6 +69,7 @@ export function aimHands(g: Game): void {
   if (h) {
     const hs = h.team === g.offTeam ? off.hs : null;
     if (hs?.shooting) {
+      h.lookAt = RIM;
       const ty = hs.shooting.type;
       if (ty === "dunk") {
         // リムへ叩き込む
@@ -73,6 +87,9 @@ export function aimHands(g: Game): void {
       // パスの種類のリリース点（左右どちらかの手・高さ）へ
       const ln = hs.passing.lane;
       both(h, v3(ln.pts[0], ln.h0));
+      // 上半身は手（リリース点）ではなく投げる先へ向ける。頭も投げる先を見る
+      h.twistCmd = clamp(angleBetween(h.f, dirTo(h.p, ln.target)), -TWIST_MAX, TWIST_MAX);
+      h.lookAt = ln.target;
     } else if (h.dribbling) {
       const di = h.hand > 0 ? 0 : 1;
       const s = h.shoulder(di);
@@ -104,7 +121,9 @@ export function aimHands(g: Game): void {
     // パスが飛んでいる: 受け手は手を出す／届く守備者は手を伸ばす
     if (b.k === "pass") {
       if (p === b.to) {
-        if (dist(p.p, b.p1) < 4) both(p, ahead);
+        // 受け手: ボールが手元に来る直前（0.15秒）までは、今のボールの高さではなく「届く地点での高さ」で構えて待つ
+        // （バウンズパスが床で弾む瞬間にかがみ込まない）
+        if (dist(p.p, b.p1) < 4) both(p, b.T - b.t > 0.15 ? v3(b.p1, b.h1) : ahead);
         continue;
       }
       if (isDef && inReach(p, ahead, 0.5 + p.lunge * 0.4)) { both(p, ahead); continue; }
@@ -127,28 +146,37 @@ export function aimHands(g: Game): void {
     // ルーズ・リバウンド: 予測した軌道上で「手が間に合い、届く」最も早い点へ手を伸ばす
     if (b.k === "loose") {
       const tp = g.loosePath;
-      let aim: V3 | null = null;
-      for (let i = 1; i < tp.length; i++) {
-        const q = tp[i];
+      const reachable = (q: { x: number; z: number; h: number; t: number }): boolean => {
         const px = p.p.x + p.v.x * q.t * 0.6, pz = p.p.z + p.v.z * q.t * 0.6;
         let r = p.handReachAt(q.h, true);
         if (r < 0 && q.h < p.shoulderY) r = p.handReachLow(q.h);
-        if (r < 0) continue;
-        if (Math.hypot(q.x - px, q.z - pz) > r + 0.1) continue;
+        if (r < 0) return false;
+        if (Math.hypot(q.x - px, q.z - pz) > r + 0.1) return false;
         // 手がそこまで動く時間
         const hw = p.handW(0);
-        if (Math.hypot(hw.x - q.x, hw.y - q.h, hw.z - q.z) / p.handSpeed > q.t + 0.08) continue;
-        aim = { x: q.x, y: q.h, z: q.z };
-        break;
+        return Math.hypot(hw.x - q.x, hw.y - q.h, hw.z - q.z) / p.handSpeed <= q.t + 0.08;
+      };
+      let ai = -1;
+      for (let i = 1; i < tp.length; i++) if (reachable(tp[i])) { ai = i; break; }
+      // いちばん早く届く点が床近く（弾んでいる最中）なら、その0.3秒先までに腰の高さ以上で届く点があればそちらで待つ
+      if (ai > 0 && tp[ai].h < 0.5) {
+        for (let j = ai + 1; j < tp.length && tp[j].t <= tp[ai].t + 0.3; j++) {
+          if (tp[j].h >= 0.7 && tp[j].h <= p.shoulderY + 0.3 && reachable(tp[j])) { ai = j; break; }
+        }
       }
-      if (aim) { both(p, aim); continue; }
-      if (inReach(p, ahead, 1.0)) {
+      if (ai > 0) { const q = tp[ai]; both(p, { x: q.x, y: q.h, z: q.z }); continue; }
+      if (inReach(p, ahead, 0.15)) {
+        // もう手の届く所にある: 今のボールへ
         if (ahead.y > p.shoulderY + p.airY()) {
           const dx = ahead.x - p.p.x, dz = ahead.z - p.p.z;
           const l = Math.hypot(dx, dz);
           const k = l > 0.45 ? 0.45 / l : 1;
           both(p, { x: p.p.x + dx * k, y: ahead.y, z: p.p.z + dz * k });
         } else both(p, ahead);
+      } else if (inReach(p, ahead, 1.0)) {
+        // まだ届かない: 今の高さに合わせてかがまず、腰の高さでボールの方へ手を構えて待つ
+        const d = dirTo(p.p, { x: ahead.x, z: ahead.z });
+        both(p, { x: p.p.x + d.x * 0.45, y: Math.max(1.0, Math.min(ahead.y, p.shoulderY)), z: p.p.z + d.z * 0.45 });
       }
       continue;
     }
@@ -161,7 +189,9 @@ export function aimHands(g: Game): void {
       // シュートモーションへのコンテスト: リリース点へ手を
       const hs = off.hs;
       if (hs.shooting && dist(p.p, h.p) < 2.2) {
-        const R: V3 = { x: h.p.x + h.f.x * 0.25, y: h.shoulderY + h.armLen * 0.92 + h.airY() + 0.15, z: h.p.z + h.f.z * 0.25 };
+        // ボールが手を離れた直後の位置（リリース点より少しリング寄り・上）へ手を伸ばす（ブロックはボールが上がっていく間）
+        const tr = dirTo(h.p, RIM);
+        const R: V3 = { x: h.p.x + tr.x * 0.45, y: h.shoulderY + h.armLen * 0.92 + h.airY() + 0.4, z: h.p.z + tr.z * 0.45 };
         both(p, R);
         continue;
       }

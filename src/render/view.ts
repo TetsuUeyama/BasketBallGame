@@ -6,9 +6,9 @@ import {
   ArcRotateCamera, Color3, Color4, DirectionalLight, DynamicTexture, Engine, HemisphericLight,
   LinesMesh, Matrix, Mesh, MeshBuilder, Quaternion, Scene, StandardMaterial, TransformNode, Vector3,
 } from "@babylonjs/core";
-import { BALL_R, COURT, CORNER_Z, NET, RIM } from "../sim/court";
+import { BALL_R, COURT, CORNER_Z, NET, RIM, netProfile } from "../sim/court";
 import type { Game } from "../sim/game";
-import { passHeight } from "../sim/lanes";
+import { passFrac, passHeight } from "../sim/lanes";
 import { V2, clamp, dist, len, lerp } from "../sim/math";
 import type { Option } from "../sim/options";
 import type { Player } from "../sim/player";
@@ -19,12 +19,20 @@ export type LaneMode = "handler" | "all" | "off";
 export type CamMode = "side" | "top" | "behind" | "follow";
 
 const LANE_PTS = 20;
+/** リング・ネットの見た目の反応に使うボールの半径（本物 BALL_R より少し大きい。入る・入らないの判定は sim の BALL_R のまま） */
+const FX_R = BALL_R + 0.05;
 const TEAM_COL = TEAMS.map((t) => t.color);
 
 interface PView {
   root: TransformNode; // 位置＋傾き（ワールド軸）
-  yaw: TransformNode;  // 向き＋構えのスケール
-  body: Mesh;
+  yaw: TransformNode;  // 下半身の向き
+  lowerN: TransformNode; // 下半身の付け根（足元）。前傾
+  lower: Mesh;         // 下半身（足〜腰）
+  upper: TransformNode; // 上半身の付け根（腰）。ひねり・前屈
+  torso: Mesh;
+  headN: TransformNode; // 頭（上半身の首の先。上半身とは別に向きを持つ）
+  head: Mesh;
+  nose: Mesh;
   mat: StandardMaterial;
   ring: Mesh;
   ringMat: StandardMaterial;
@@ -45,6 +53,8 @@ export class View {
   stadium: Stadium;
   laneMode: LaneMode = "handler";
   showBalance = true;
+  /** 頭の上の表示（背番号・ポジション・今やっていること） */
+  showLabels = true;
   camMode: CamMode = "side";
   private pv = new Map<number, PView>();
   private ball: Mesh;
@@ -52,6 +62,10 @@ export class View {
   private nets: LinesMesh[] = [];
   private netSwing = [{ x: 0, z: 0, vx: 0, vz: 0 }, { x: 0, z: 0, vx: 0, vz: 0 }];
   private netBulge = [0, 0];
+  /** 網が下へ引っぱられる量（網の長さに対する割合）とその速さ */
+  private netPull = [{ x: 0, v: 0 }, { x: 0, v: 0 }];
+  /** リングの見た目の揺れの再発までの時間 */
+  private rimCd = [0, 0];
   /** 表示の向き: sim は攻撃側の座標なので、Game.flip なら x,z を反転して描く */
   private F = 1;
   private camZ = 0;
@@ -59,6 +73,16 @@ export class View {
   private lanes: LinesMesh[] = [];
   private yawSign = 1;
   private tiltSign = 1;
+  private crossSign = 1;
+  /** ワールド軸の回転 dq を今の回転 q の後に掛けるのが dq.multiply(q) か（calibrate で実測） */
+  private worldPreMul = true;
+  private ballPrev: Vector3 | null = null;
+  /**
+   * ゴールの揺れ（見た目だけ）。[0]=表示の +Z 側 / [1]=−Z 側。
+   * bz = ボードの前後（コートの外向きが正）、by = ボードの上下（下が正）、ry = リングの沈み（下が正）。v… はその速さ
+   */
+  private goals: { assy: TransformNode; rimN: TransformNode; bz: number; bvz: number; by: number; bvy: number; ry: number; rvy: number }[] = [];
+  private ballOmega = new Vector3(0, 0, 0);
 
   constructor(canvas: HTMLCanvasElement, g: Game) {
     this.engine = new Engine(canvas, true, { preserveDrawingBuffer: false, stencil: false });
@@ -83,14 +107,29 @@ export class View {
 
     this.buildCourt();
     this.stadium = new Stadium(scene, g.names);
+    this.stadium.attachBoardLogo(1, this.goals[0].assy);
+    this.stadium.attachBoardLogo(-1, this.goals[1].assy);
     this.stadium.setSides(this.negZTeam(g));
     void this.stadium.setQuality("low");
     for (const p of g.players) this.pv.set(p.id, this.buildPlayer(p));
 
-    this.ball = MeshBuilder.CreateSphere("ball", { diameter: 0.24, segments: 12 }, scene);
+    this.ball = MeshBuilder.CreateSphere("ball", { diameter: BALL_R * 2, segments: 16 }, scene);
+    this.ball.rotationQuaternion = Quaternion.Identity();
     const bm = new StandardMaterial("ballm", scene);
-    bm.diffuseColor = new Color3(0.95, 0.5, 0.12);
-    bm.emissiveColor = new Color3(0.3, 0.12, 0.02);
+    // 縫い目（経線4本＋赤道）を描いて回転が見えるように
+    const btex = new DynamicTexture("balltex", { width: 256, height: 128 }, scene, true);
+    const bctx = btex.getContext() as CanvasRenderingContext2D;
+    bctx.fillStyle = "#e8792b";
+    bctx.fillRect(0, 0, 256, 128);
+    bctx.strokeStyle = "#1a1208";
+    bctx.lineWidth = 4;
+    bctx.beginPath();
+    for (const x of [2, 66, 130, 194]) { bctx.moveTo(x, 0); bctx.lineTo(x, 128); }
+    bctx.moveTo(0, 64); bctx.lineTo(256, 64);
+    bctx.stroke();
+    btex.update();
+    bm.diffuseTexture = btex;
+    bm.emissiveColor = new Color3(0.25, 0.12, 0.04);
     this.ball.material = bm;
 
     for (let i = 0; i < 40; i++) {
@@ -120,7 +159,41 @@ export class View {
       `[view] モデルの前 = local +Z（ノーズの位置） / yawSign=${this.yawSign} tiltSign=${this.tiltSign}` +
       ` / facing(+1,0) → world forward (${fwd.x.toFixed(3)}, ${fwd.y.toFixed(3)}, ${fwd.z.toFixed(3)})（期待値 (1,0,0)）`,
     );
+    // 上半身の軸: local +Y(上) と +Z(前) が与えたベクトルを向くか、右(local +X)の外積の向きを実測で決める
+    const tu = new Vector3(Math.sin(0.5), Math.cos(0.5), 0);
+    const tf = new Vector3(Math.cos(0.5), -Math.sin(0.5), 0);
+    let ok = false;
+    for (const sgn of [1, -1]) {
+      this.crossSign = sgn;
+      probe.rotationQuaternion = this.basis(tu, tf);
+      probe.computeWorldMatrix(true);
+      const gy = probe.getDirection(new Vector3(0, 1, 0)), gz = probe.getDirection(new Vector3(0, 0, 1));
+      if (Vector3.Distance(gy, tu) < 1e-3 && Vector3.Distance(gz, tf) < 1e-3) { ok = true; break; }
+    }
+    console.log(
+      `[view] 上半身の軸: crossSign=${this.crossSign} / 前屈0.5rad・前(+X) → 上(${tu.x.toFixed(3)}, ${tu.y.toFixed(3)}, 0) 前(${tf.x.toFixed(3)}, ${tf.y.toFixed(3)}, 0)` +
+      (ok ? "（一致）" : "（⚠️ 一致しない: 上半身の向きが正しく描けていない）"),
+    );
+    // 回転の合成の順: 「q0 の後にワールド軸の dq」が dq.multiply(q0) か q0.multiply(dq) か
+    {
+      const q0 = Quaternion.RotationAxis(new Vector3(1, 0, 0), 0.7);
+      const dq = Quaternion.RotationAxis(new Vector3(0, 1, 0), 0.4);
+      const m0 = new Matrix(), m1 = new Matrix(), mc = new Matrix();
+      q0.toRotationMatrix(m0);
+      dq.toRotationMatrix(m1);
+      const want = Vector3.TransformCoordinates(Vector3.TransformCoordinates(new Vector3(0, 0, 1), m0), m1);
+      dq.multiply(q0).toRotationMatrix(mc);
+      const a = Vector3.TransformCoordinates(new Vector3(0, 0, 1), mc);
+      this.worldPreMul = Vector3.Distance(a, want) < 1e-4;
+      console.log(`[view] ボールの回転の合成: ${this.worldPreMul ? "dq.multiply(q)" : "q.multiply(dq)"}`);
+    }
     probe.dispose();
+  }
+
+  /** local +Y を up、+Z を fwd へ向ける回転（右 = up × fwd、符号は calibrate で実測） */
+  private basis(up: Vector3, fwd: Vector3): Quaternion {
+    const right = Vector3.Cross(up, fwd).scaleInPlace(this.crossSign);
+    return Quaternion.RotationQuaternionFromAxis(right, up, fwd);
   }
 
   /**
@@ -205,7 +278,14 @@ export class View {
       line(`ft${sg}`, arc(0, COURT.ftZ, 1.8, -Math.PI / 2, Math.PI / 2, 32));
       line(`ra${sg}`, arc(RIM.x, RIM.z, COURT.raR, -Math.PI / 2, Math.PI / 2, 24));
 
+      // 揺れる部分: ボード・アーム・ブーム（assy）と、その中のリング（rimN）。支柱は動かない。
+      // 親は原点・無回転なので、子の位置はこれまでどおりワールドの値
+      const assy = new TransformNode(`goal${sg}`, scene);
+      const rimN = new TransformNode(`rimN${sg}`, scene);
+      rimN.parent = assy;
+      this.goals[sg > 0 ? 0 : 1] = { assy, rimN, bz: 0, bvz: 0, by: 0, bvy: 0, ry: 0, rvy: 0 };
       const bb = MeshBuilder.CreateBox(`board${sg}`, { width: 1.8, height: 1.05, depth: 0.05 }, scene);
+      bb.parent = assy;
       bb.position = new Vector3(0, 2.9 + 0.525, (COURT.boardZ + 0.025) * sg);
       bb.material = bbm;
       const net = MeshBuilder.CreateLineSystem(`net${sg}`, { lines: this.netLines(sg, -10, 0, this.netSwing[sg > 0 ? 0 : 1]), updatable: true }, scene);
@@ -216,15 +296,18 @@ export class View {
       const rim = MeshBuilder.CreateTorus(`rim${sg}`, { diameter: COURT.rimR * 2, thickness: 0.025, tessellation: 32 }, scene);
       rim.position = new Vector3(RIM.x, COURT.rimH, RIM.z * sg);
       rim.material = rm;
+      rim.parent = rimN;
       const arm = MeshBuilder.CreateBox(`rimarm${sg}`, { width: 0.06, height: 0.04, depth: COURT.boardZ - RIM.z - COURT.rimR }, scene);
       arm.position = new Vector3(0, COURT.rimH, ((COURT.boardZ + RIM.z + COURT.rimR) / 2) * sg);
       arm.material = rm;
+      arm.parent = rimN;
       const pole = MeshBuilder.CreateBox(`pole${sg}`, { width: 0.25, height: 3.4, depth: 0.25 }, scene);
       pole.position = new Vector3(0, 1.7, (B + 1.0) * sg);
       pole.material = pom;
       const boom = MeshBuilder.CreateBox(`boom${sg}`, { width: 0.15, height: 0.15, depth: B + 1.0 - COURT.boardZ }, scene);
       boom.position = new Vector3(0, 3.3, ((B + 1.0 + COURT.boardZ) / 2) * sg);
       boom.material = pom;
+      boom.parent = assy;
     }
   }
 
@@ -233,29 +316,53 @@ export class View {
     const root = new TransformNode(`p${p.id}`, scene);
     const yaw = new TransformNode(`p${p.id}yaw`, scene);
     yaw.parent = root;
-    const h = p.a.height;
-    const body = MeshBuilder.CreateCylinder(`p${p.id}body`, { height: h * 0.92, diameter: p.radius * 2, tessellation: 20 }, scene);
-    body.parent = yaw;
-    body.position = new Vector3(0, (h * 0.92) / 2, 0);
     const mat = new StandardMaterial(`p${p.id}m`, scene);
     mat.diffuseColor = TEAM_COL[p.team];
     mat.specularColor = new Color3(0.15, 0.15, 0.15);
-    body.material = mat;
+    // 高さ1・底が原点の円柱（高さはスケールで毎フレーム合わせる）
+    const unitCyl = (name: string, parent: TransformNode): Mesh => {
+      const m = MeshBuilder.CreateCylinder(name, { height: 1, diameter: p.radius * 2, tessellation: 20 }, scene);
+      m.bakeTransformIntoVertices(Matrix.Translation(0, 0.5, 0));
+      m.parent = parent;
+      m.material = mat;
+      return m;
+    };
+    // 下半身（足〜腰）: 足元を原点に、下半身の向きへの前傾を毎フレーム回転で与える
+    const lowerN = new TransformNode(`p${p.id}lowerN`, scene);
+    lowerN.parent = root;
+    const lower = unitCyl(`p${p.id}lower`, lowerN);
+    // 上半身（腰〜首）: 腰を原点に、ひねり・前屈を毎フレーム回転で与える
+    const upper = new TransformNode(`p${p.id}upper`, scene);
+    upper.parent = root;
+    const torso = unitCyl(`p${p.id}torso`, upper);
     // 頭
     const head = MeshBuilder.CreateSphere(`p${p.id}head`, { diameter: 0.24, segments: 10 }, scene);
-    head.parent = yaw;
-    head.position = new Vector3(0, h * 0.92 + 0.1, 0);
+    const headN = new TransformNode(`p${p.id}headN`, scene);
+    headN.parent = root;
+    head.parent = headN;
     const hm = new StandardMaterial(`p${p.id}hm`, scene);
     hm.diffuseColor = new Color3(0.85, 0.72, 0.6);
     head.material = hm;
-    // ノーズ（前 = local +Z）
-    const nose = MeshBuilder.CreateBox(`p${p.id}nose`, { width: 0.12, height: 0.1, depth: 0.16 }, scene);
-    nose.parent = yaw;
-    nose.position = new Vector3(0, h * 0.72, p.radius + 0.05);
+    // 目（頭の前 = local +Z）。頭の向きが上半身・足と別に見える
+    const eyes = MeshBuilder.CreateBox(`p${p.id}eyes`, { width: 0.14, height: 0.045, depth: 0.05 }, scene);
+    eyes.parent = headN;
+    eyes.position = new Vector3(0, 0.02, 0.11);
+    const em = new StandardMaterial(`p${p.id}em`, scene);
+    em.diffuseColor = new Color3(0.08, 0.08, 0.1);
+    em.emissiveColor = new Color3(0.05, 0.05, 0.08);
+    eyes.material = em;
+    // ノーズ（上半身の前 = local +Z、胸の高さ）
     const nm = new StandardMaterial(`p${p.id}nm`, scene);
     nm.diffuseColor = new Color3(0.95, 0.95, 0.95);
     nm.emissiveColor = new Color3(0.3, 0.3, 0.3);
+    const nose = MeshBuilder.CreateBox(`p${p.id}nose`, { width: 0.12, height: 0.1, depth: 0.16 }, scene);
+    nose.parent = upper;
     nose.material = nm;
+    // つま先（下半身の前 = local +Z）。上半身をひねると胸のノーズとずれて見える
+    const toe = MeshBuilder.CreateBox(`p${p.id}toe`, { width: 0.14, height: 0.06, depth: 0.14 }, scene);
+    toe.parent = yaw;
+    toe.position = new Vector3(0, 0.03, p.radius + 0.04);
+    toe.material = nm;
 
     const ring = MeshBuilder.CreateTorus(`p${p.id}ring`, { diameter: 1, thickness: 0.018, tessellation: 32 }, scene);
     const ringMat = new StandardMaterial(`p${p.id}rm`, scene);
@@ -298,7 +405,7 @@ export class View {
       arms.push(arm);
     }
 
-    return { root, yaw, body, mat, ring, ringMat, com, comMat, label, tex, text: "", hands, arms };
+    return { root, yaw, lowerN, lower, upper, torso, headN, head, nose, mat, ring, ringMat, com, comMat, label, tex, text: "", hands, arms };
   }
 
   private drawLabel(v: PView, p: Player, team: string): void {
@@ -331,14 +438,40 @@ export class View {
     const F = g.flip ? -1 : 1;
     this.F = F;
     this.stadium.setSides(this.negZTeam(g));
+    this.shakeGoals(g, F);
     const holder = g.holder();
     for (const p of g.players) {
       const v = this.pv.get(p.id)!;
       v.root.position.set(p.p.x * F, p.airY(), p.p.z * F);
       // 向き: モデルの前(+Z)と facing（表示の向き）の差
       v.yaw.rotationQuaternion = Quaternion.RotationAxis(Vector3.Up(), this.yawSign * Math.atan2(p.f.x * F, p.f.z * F));
-      const st = p.stance;
-      v.yaw.scaling.set(1 + 0.22 * st, 1 - 0.14 * st, 1 + 0.22 * st);
+      // 下半身: 足元から下半身の向き f へ前傾 lt、長さ legLen（構え・かがむで縮む）。太さは上半身と同じ
+      const lt = p.lowerTilt;
+      const ls = Math.sin(lt), lc = Math.cos(lt);
+      v.lowerN.rotationQuaternion = this.basis(
+        new Vector3(p.f.x * F * ls, lc, p.f.z * F * ls),
+        new Vector3(p.f.x * F * lc, -ls, p.f.z * F * lc),
+      );
+      v.lower.scaling.set(1, p.legLen, 1);
+      // 上半身: 腰から、ひねった向き fu へ前屈 th。軸の向きをベクトルで与える（回転角のハードコードなし）
+      const fu = p.upperF();
+      const th = p.trunkNow;
+      const sn = Math.sin(th), cs = Math.cos(th);
+      const up = new Vector3(fu.x * F * sn, cs, fu.z * F * sn);
+      const fwd = new Vector3(fu.x * F * cs, -sn, fu.z * F * cs);
+      // 腰（下半身の先端）から上半身
+      v.upper.position.set(p.f.x * F * p.hipFwd, p.hipY, p.f.z * F * p.hipFwd);
+      v.upper.rotationQuaternion = this.basis(up, fwd);
+      const upperLen = p.torsoLen * (0.4 / 0.29);
+      v.torso.scaling.y = upperLen;
+      // 頭: 首の先（上半身の軸の先）に置き、上半身の前から headYaw だけ回した向きへ（上半身の軸に直交させる）
+      const hip = new Vector3(p.f.x * F * p.hipFwd, p.hipY, p.f.z * F * p.hipFwd);
+      v.headN.position.copyFrom(hip.add(up.scale(upperLen + 0.1)));
+      const hf = p.headF();
+      const hv = new Vector3(hf.x * F, 0, hf.z * F);
+      const hfp = hv.subtract(up.scale(Vector3.Dot(hv, up)));
+      if (hfp.lengthSquared() > 1e-6) v.headN.rotationQuaternion = this.basis(up, hfp.normalize());
+      v.nose.position.set(0, p.torsoLen * 0.69, p.radius + 0.05);
       // 傾き: 重心のずれの向きへ（崩れているほど大きく）
       const c = { x: p.bal.c.x * F, z: p.bal.c.z * F };
       const cl = len(c);
@@ -350,10 +483,16 @@ export class View {
         const k = Math.min(1, elapsed / 0.25, p.fallT / 0.35);
         const fd = { x: p.fallDir.x * F, z: p.fallDir.z * F };
         v.root.rotationQuaternion = Quaternion.RotationAxis(new Vector3(fd.z, 0, -fd.x), this.tiltSign * lerp(tilt, 1.38, k));
-      } else if (cl > 1e-4 || p.bend > 0.05) {
-        // 重心のずれの傾き＋かがむ（前へ）傾き
-        const bx = (cl > 1e-4 ? (c.x / cl) * tilt : 0) + p.f.x * F * p.bend * 0.7;
-        const bz = (cl > 1e-4 ? (c.z / cl) * tilt : 0) + p.f.z * F * p.bend * 0.7;
+      } else if (cl > 1e-4) {
+        // 重心のずれの傾き（かがむ・前屈は下半身の高さと上半身の回転で表す）
+        let bx = (c.x / cl) * tilt;
+        let bz = (c.z / cl) * tilt;
+        if (p.staggering) {
+          // ふらつき: 崩れた向きと直角に左右へよろめく（約2回/秒、選手ごとに位相をずらす）
+          const w = 0.14 * Math.sin(g.t * 13 + p.id * 1.7);
+          bx += (-c.z / cl) * w;
+          bz += (c.x / cl) * w;
+        }
         const ang = Math.hypot(bx, bz);
         v.root.rotationQuaternion = ang > 1e-4 ? Quaternion.RotationAxis(new Vector3(bz / ang, 0, -bx / ang), this.tiltSign * ang) : Quaternion.Identity();
       } else v.root.rotationQuaternion = Quaternion.Identity();
@@ -368,7 +507,7 @@ export class View {
         v.ring.position.set(p.p.x * F, 0.02, p.p.z * F);
         v.ring.scaling.set(R * 2, 1, R * 2);
         const r = p.bal.ratio;
-        const col = p.bal.off ? new Color3(1, 0.15, 0.15) : r > 0.75 ? new Color3(1, 0.8, 0.15) : new Color3(0.3, 0.9, 0.4);
+        const col = p.staggering ? new Color3(1, 0.5, 0.05) : p.bal.off ? new Color3(1, 0.15, 0.15) : r > 0.75 ? new Color3(1, 0.8, 0.15) : new Color3(0.3, 0.9, 0.4);
         v.ringMat.emissiveColor = col;
         v.com.position.set(p.p.x * F + c.x, 0.03, p.p.z * F + c.z);
         v.comMat.emissiveColor = col;
@@ -388,13 +527,17 @@ export class View {
         MeshBuilder.CreateLines(v.arms[i].name, { points: [tilted(sh.x, sh.y, sh.z), hv], instance: v.arms[i] });
       }
 
-      v.label.position.set(p.p.x * F, p.a.height + 0.75 + p.airY(), p.p.z * F);
-      this.drawLabel(v, p, p.team === 0 ? "#ff8a80" : "#82b1ff");
+      v.label.isVisible = this.showLabels;
+      if (this.showLabels) {
+        v.label.position.set(p.p.x * F, p.a.height + 0.75 + p.airY(), p.p.z * F);
+        this.drawLabel(v, p, p.team === 0 ? "#ff8a80" : "#82b1ff");
+      }
     }
 
     const bp = g.ballPos();
     const bx = bp.p.x * F, bz = bp.p.z * F;
     this.ball.position.set(bx, bp.h, bz);
+    this.spinBall(g, bx, bp.h, bz);
 
     this.updateNet(bx, bp.h, bz, g.ball.k === "dead" || g.ball.k === "shot" || g.ball.k === "loose");
     this.drawLanes(g);
@@ -418,22 +561,101 @@ export class View {
     this.scene.render();
   }
 
+  // ------------------------------------------------------------------ ボールの回転（見た目だけ）
+
+  /**
+   * シュート・パスはバックスピン（上側が進む向きと逆へ回る）、床を転がるボールは転がりの回転、
+   * 空中のルーズボールは回転が残り、持っている間は止まっていく。
+   */
+  private spinBall(g: Game, x: number, y: number, z: number): void {
+    const dt = Math.min(0.05, this.engine.getDeltaTime() / 1000);
+    const prev = this.ballPrev;
+    this.ballPrev = new Vector3(x, y, z);
+    if (!prev || dt <= 0) return;
+    const v = new Vector3((x - prev.x) / dt, 0, (z - prev.z) / dt);
+    const vh = v.length();
+    if (vh > 25) return; // 攻守交代などで表示の座標が飛んだ
+    const up = new Vector3(0, 1, 0);
+    const k = g.ball.k;
+    if ((k === "shot" || k === "pass" || k === "inbound") && vh > 0.3) {
+      // バックスピン 約2.5回転/秒: 軸 = 進む向き × 上（上側の点が進む向きと逆へ動く）
+      this.ballOmega = Vector3.Cross(v.scale(1 / vh), up).scaleInPlace(2.5 * Math.PI * 2);
+    } else if ((k === "loose" || k === "dead") && y <= BALL_R + 0.02) {
+      // 床を転がる: 接地点が滑らない回転 ω = 上 × v / r
+      this.ballOmega = Vector3.Cross(up, v).scaleInPlace(1 / BALL_R);
+    } else if (k === "held") {
+      this.ballOmega.scaleInPlace(Math.exp(-dt * 8));
+    } else {
+      this.ballOmega.scaleInPlace(Math.exp(-dt * 0.3));
+    }
+    const w = this.ballOmega.length();
+    if (w < 1e-3) return;
+    const dq = Quaternion.RotationAxis(this.ballOmega.scale(1 / w), w * dt);
+    const q = this.ball.rotationQuaternion!;
+    // ワールド軸の回転を今の向きの「後に」掛ける（掛ける順は calibrate で実測）
+    this.ball.rotationQuaternion = (this.worldPreMul ? dq.multiply(q) : q.multiply(dq)).normalize();
+  }
+
+  // ------------------------------------------------------------------ リング・ボードの揺れ（見た目だけ）
+
+  /**
+   * sim が記録した当たり（g.impacts）で、リング・ボードをばねで揺らす。
+   * リング: 当たると沈んで細かく震える（8Hz）。ボード: 当たると外へ押されて前後に揺れる（4.5Hz）、上下にも少し（6Hz）。
+   * リングに当たってもボードは少し揺れる。強さは当たった速さに比例（ダンクは強く）。
+   */
+  private shakeGoals(g: Game, F: number): void {
+    for (const e of g.impacts) {
+      const G = this.goals[e.z * F > 0 ? 0 : 1];
+      if (!G) continue;
+      const sp = Math.min(16, e.speed);
+      if (e.part === "rim") { G.rvy += 0.2 * sp; G.bvy += 0.04 * sp; G.bvz += 0.03 * sp; }
+      else { G.bvz += 0.12 * sp; G.bvy += 0.02 * sp; }
+    }
+    g.impacts.length = 0;
+    const dt = Math.min(0.05, this.engine.getDeltaTime() / 1000);
+    // ばね x'' = −ω²x − 2ζωx'（半陰的オイラー、安定のため刻みを細かく）
+    const spring = (x: number, v: number, f: number, zeta: number, h: number): [number, number] => {
+      const w = 2 * Math.PI * f;
+      v += (-w * w * x - 2 * zeta * w * v) * h;
+      return [x + v * h, v];
+    };
+    const n = Math.max(1, Math.ceil(dt / (1 / 240)));
+    const h = dt / n;
+    this.goals.forEach((G, i) => {
+      for (let k = 0; k < n; k++) {
+        [G.bz, G.bvz] = spring(G.bz, G.bvz, 4.5, 0.06, h);
+        [G.by, G.bvy] = spring(G.by, G.bvy, 6, 0.08, h);
+        [G.ry, G.rvy] = spring(G.ry, G.rvy, 8, 0.12, h);
+      }
+      G.bz = clamp(G.bz, -0.06, 0.06);
+      G.by = clamp(G.by, -0.04, 0.04);
+      G.ry = clamp(G.ry, -0.03, 0.08);
+      const sg = i === 0 ? 1 : -1;
+      G.assy.position.set(0, -G.by, G.bz * sg);
+      G.rimN.position.set(0, -G.ry, 0);
+    });
+  }
+
   // ------------------------------------------------------------------ ネット
 
   /** ネットの形: 縦糸12本（各4節）と横の輪4段。ballY の高さで膨らみ、下ほど揺れ(sw)でずれる。sg=表示のどちらのゴールか */
   private netLines(sg: number, ballY: number, bulge: number, sw: { x: number; z: number }): Vector3[][] {
     const N = 12, SEG = 4;
-    const top = COURT.rimH;
-    const cz = RIM.z * sg;
+    // リング・ボードの揺れに付いていく
+    const gl = this.goals[sg > 0 ? 0 : 1];
+    const gl2 = this.netPull[sg > 0 ? 0 : 1];
+    const top = COURT.rimH - (gl ? gl.by + gl.ry : 0);
+    const cz = RIM.z * sg + (gl ? gl.bz * sg : 0);
     const pt = (i: number, k: number): Vector3 => {
       const u = k / SEG; // 0=リム 1=下の口
       const a = (i / N) * Math.PI * 2 + (k % 2) * (Math.PI / N); // 網目らしく交互にずらす
-      // 網の長さは変えない（下へ伸ばさない）
-      const y = top - NET.len * u;
-      let r = lerp(COURT.rimR, NET.rBottom, u);
+      // 落ちてきたボールに引っぱられて網が下へ伸びる（下ほど大きく、ばねで戻る）
+      const y = top - NET.len * u * (1 + (gl2 ? gl2.x : 0) * u);
+      let r = netProfile(u); // sim と同じ網の形
       // ボールが居る高さでは網がボールを包む太さまで押し広げられる
-      const wrap = Math.exp(-(((y - ballY) / 0.13) ** 2)) * bulge;
-      r += Math.max(0, BALL_R + 0.012 - r) * wrap + 0.015 * wrap;
+      // 見た目の反応は本物のボールより少し大きい FX_R で（大きく膨らむ）
+      const wrap = Math.exp(-(((y - ballY) / 0.18) ** 2)) * bulge;
+      r += Math.max(0, FX_R + 0.012 - r) * wrap + 0.025 * wrap;
       return new Vector3(RIM.x + Math.cos(a) * r + sw.x * u * u, y, cz + Math.sin(a) * r + sw.z * u * u);
     };
     const lines: Vector3[][] = [];
@@ -450,37 +672,61 @@ export class View {
     return lines;
   }
 
-  /** ボールがネットの中を通ると膨らみ、通った勢いで揺れて戻る（ばね）。表示の座標で受け取る */
+  /**
+   * ボールがネットの中を通ると膨らみ・下へ引っぱられ、通った勢いで揺れて戻る（ばね）。表示の座標で受け取る。
+   * 見た目の反応だけは本物のボールより少し外側（FX_R）で起こす（入る・入らないの判定は sim のまま）。
+   * ボールがリングのすぐ近くを通ったときもリングを少し揺らす（同じゴールは0.3秒に1回まで）。
+   */
   private updateNet(bx: number, by: number, bz: number, free: boolean): void {
     const dt = Math.min(0.05, this.engine.getDeltaTime() / 1000);
     const cur = { x: bx, y: by, z: bz };
-    let vx = 0, vz = 0;
+    let vx = 0, vy = 0, vz = 0;
     if (this.prevBall && dt > 0) {
       vx = (cur.x - this.prevBall.x) / dt;
+      vy = (cur.y - this.prevBall.y) / dt;
       vz = (cur.z - this.prevBall.z) / dt;
     }
     this.prevBall = cur;
+    const jump = Math.hypot(vx, vz) > 25; // 攻守交代などで表示の座標が飛んだ
     for (const sg of [1, -1]) {
       const i = sg > 0 ? 0 : 1;
       const sw = this.netSwing[i];
       const dRim = Math.hypot(bx - RIM.x, bz - RIM.z * sg);
-      const inNet = free && dRim < COURT.rimR + 0.08 && by < COURT.rimH + 0.1 && by > COURT.rimH - NET.len - 0.1;
+      const inNet = free && !jump && dRim < COURT.rimR + FX_R && by < COURT.rimH + FX_R && by > COURT.rimH - NET.len - FX_R;
+      // 網のすぐ外を通った（外れて落ちる等）: 網の外側に当たって少し押される
+      const brush = free && !jump && !inNet && dRim < COURT.rimR + FX_R + 0.12 && by < COURT.rimH && by > COURT.rimH - NET.len;
       // リムに当たって跳ねる（リムの高さのすぐ外）ときも少し揺らす
-      const onRim = free && dRim < COURT.rimR + 0.3 && Math.abs(by - COURT.rimH) < 0.25 && !inNet;
+      const onRim = free && !jump && dRim < COURT.rimR + 0.3 && Math.abs(by - COURT.rimH) < 0.25 && !inNet;
       if (inNet) {
-        this.netBulge[i] = Math.min(1, this.netBulge[i] + dt * 10);
-        sw.vx += vx * dt * 6 + (Math.random() - 0.5) * 0.02;
-        sw.vz += vz * dt * 6 + (Math.random() - 0.5) * 0.02;
+        this.netBulge[i] = Math.min(1, this.netBulge[i] + dt * 12);
+        sw.vx += vx * dt * 10 + (Math.random() - 0.5) * 0.04;
+        sw.vz += vz * dt * 10 + (Math.random() - 0.5) * 0.04;
+        // 落ちる勢いで網が下へ引っぱられる
+        if (vy < 0) this.netPull[i].v += -vy * dt * 2.2;
       } else {
         this.netBulge[i] = Math.max(0, this.netBulge[i] - dt * 4);
-        if (onRim) { sw.vx += vx * dt * 1.5; sw.vz += vz * dt * 1.5; }
+        if (onRim) { sw.vx += vx * dt * 2.5; sw.vz += vz * dt * 2.5; }
+        if (brush) {
+          const ax = (RIM.x - bx) / Math.max(1e-3, dRim), az = (RIM.z * sg - bz) / Math.max(1e-3, dRim);
+          sw.vx += ax * dt * 3; sw.vz += az * dt * 3;
+        }
+      }
+      // リングのすぐ近く（リングの管からボールの中心まで FX_R 以内）をシュート・ゴール後のボールが通った → リングを少し揺らす
+      this.rimCd[i] = Math.max(0, this.rimCd[i] - dt);
+      const ringD = Math.hypot(dRim - COURT.rimR, by - COURT.rimH);
+      if (free && !jump && this.rimCd[i] <= 0 && ringD < FX_R + 0.0125) {
+        const G = this.goals[i];
+        if (G) { G.rvy += 0.08 * Math.hypot(vx, vy, vz); this.rimCd[i] = 0.3; }
       }
       // ばね（揺れて戻る）
       const k = 60, c = 5;
       sw.vx += (-k * sw.x - c * sw.vx) * dt;
       sw.vz += (-k * sw.z - c * sw.vz) * dt;
-      sw.x = clamp(sw.x + sw.vx * dt, -0.12, 0.12);
-      sw.z = clamp(sw.z + sw.vz * dt, -0.12, 0.12);
+      sw.x = clamp(sw.x + sw.vx * dt, -0.18, 0.18);
+      sw.z = clamp(sw.z + sw.vz * dt, -0.18, 0.18);
+      const pl = this.netPull[i];
+      pl.v += (-90 * pl.x - 7 * pl.v) * dt;
+      pl.x = clamp(pl.x + pl.v * dt, -0.1, 0.4);
       MeshBuilder.CreateLineSystem(`net${sg}`, { lines: this.netLines(sg, inNet ? by : -10, this.netBulge[i], sw), instance: this.nets[i] });
     }
   }
@@ -536,15 +782,30 @@ export class View {
           case "drive":
             put(poly(L.pts, 0.04), col, 0.95);
             break;
+          case "post":
+            // 押し込みドリブル: 今の位置からゴール下の手前まで（少し高めの線）
+            put(poly(L.pts, 0.1), col, 0.95);
+            break;
+          case "step": {
+            // ステップの線（少し高く）と、着地してからの狙い（シュートの弧／突破の線）を薄く
+            put(poly(L.pts, 0.08), col, 0.95);
+            const A = o.after;
+            if (A?.kind === "shot") put(arc(L.target, L.from.a.height + 0.2, RIM, COURT.rimH, 0.9 + 0.08 * dist(L.target, RIM)), this.laneColor(A.open), 0.4);
+            else if (A?.kind === "drive") put(poly(A.pts, 0.04), this.laneColor(A.open), 0.4);
+            break;
+          }
           case "pass":
           case "lead":
           case "lob": {
             // パスの種類どおりの高さ（バウンズは床で弾む・オーバーヘッドは頭上から・ロブは山なり）
+            // 重力の放物線＋空気抵抗（sim と同じ関数）。u = 飛行時間の割合
             const a0 = L.pts[0];
             const Ll = dist(a0, L.target);
+            const Tf = Ll / Math.max(0.1, L.speed);
             put(Array.from({ length: LANE_PTS }, (_, i) => {
-              const s = i / (LANE_PTS - 1);
-              return new Vector3(lerp(a0.x, L.target.x, s), passHeight(L.style, L.h0, L.endH, s, Ll), lerp(a0.z, L.target.z, s));
+              const u = i / (LANE_PTS - 1);
+              const s = passFrac(u, Ll);
+              return new Vector3(lerp(a0.x, L.target.x, s), passHeight(L.style, L.h0, L.endH, u, Tf), lerp(a0.z, L.target.z, s));
             }), col, o.kind === "pass" ? 0.85 : 1);
             if (this.laneMode === "all" && o.after) {
               const A = o.after;
@@ -579,8 +840,9 @@ export class View {
       const b = g.ball;
       if (b.k === "pass") {
         const pts = Array.from({ length: LANE_PTS }, (_, i) => {
-          const s = i / (LANE_PTS - 1);
-          return new Vector3(lerp(b.p0.x, b.p1.x, s), passHeight(b.style, b.h0, b.h1, s, b.L), lerp(b.p0.z, b.p1.z, s));
+          const u = i / (LANE_PTS - 1);
+          const s = passFrac(u, b.L);
+          return new Vector3(lerp(b.p0.x, b.p1.x, s), passHeight(b.style, b.h0, b.h1, u, b.T), lerp(b.p0.z, b.p1.z, s));
         });
         put(pts, new Color3(1, 1, 1), 0.9);
       }

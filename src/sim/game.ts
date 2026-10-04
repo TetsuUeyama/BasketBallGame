@@ -1,12 +1,13 @@
 // 試合進行（ハーフコート。両チームが同じゴールを交互に攻める）。
 import { PlayerDef, makeTeam, n } from "./attrs";
-import { BALL_R, BOARD, COURT, NET, RIM, SPOT, baselineInbound, distRim, outOfBounds, throwInSpot } from "./court";
+import { BALL_R, BOARD, COURT, NET, NET_STRETCH, RIM, netRadiusAt, SPOT, baselineInbound, distRim, isThree, outOfBounds, throwInSpot } from "./court";
 import { dot } from "./math";
 import { resolveContacts } from "./contact";
 import { Defense } from "./defense";
+import { StealDef, stripChance } from "./duel";
 import { SHOT_LABEL, ShotType, pMakeType, shotBase } from "./eval";
-import { Lane, LaneKind, PASS_LABEL, PassStyle, passHeight } from "./lanes";
-import { V, V2, add, clamp, copy, dirTo, dist, len, lerp, lerpV, madd, mul, norm, Rng } from "./math";
+import { G, Lane, LaneKind, PASS_LABEL, PassStyle, ballistic, ballisticVy, passFrac, passHeight, passHSpeed, passVy } from "./lanes";
+import { V, V2, add, clamp, copy, dirTo, dist, len, lerp, lerpV, madd, mul, norm, sub, Rng } from "./math";
 import { Offense } from "./offense";
 import { DT, Player, Team, V3, dist3 } from "./player";
 import { aimHands } from "./hands";
@@ -18,8 +19,8 @@ export type Phase = "setup" | "jumpball" | "throwin" | "live" | "dead" | "gameov
 export type BallState =
   | { k: "held"; owner: Player }
   | { k: "pass"; from: Player; to: Player; p0: V2; p1: V2; h0: number; h1: number; T: number; t: number; lob: boolean; style: PassStyle; L: number; tried: Set<number>; lane: LaneKind; open: number }
-  | { k: "shot"; by: Player; p0: V2; h0: number; T: number; t: number; made: boolean; pts: number; open: number; tried: Set<number>; rim: boolean; apex: number; type: ShotType; dev: V2; tipped: boolean }
-  | { k: "loose"; p: V2; v: V2; h: number; vy: number; t: number; lastTouch: Team; noGrab?: number; noGrabT?: number }
+  | { k: "shot"; by: Player; p0: V2; h0: number; T: number; t: number; made: boolean; pts: number; open: number; tried: Set<number>; rim: boolean; type: ShotType; dev: V2; tipped: boolean; forced?: boolean }
+  | { k: "loose"; p: V2; v: V2; h: number; vy: number; t: number; lastTouch: Team; noGrab?: number; noGrabT?: number; stripBy?: number; grabAfter?: number }
   | { k: "dead"; p: V2; h: number; v?: V2; vy?: number }
   | { k: "inbound"; p0: V2; h0: number; to: Player; t: number; T: number };
 
@@ -65,6 +66,11 @@ export class Game {
   private lastWasShot = false;
   /** ルーズボールの予測軌道（表示と手の狙い用、毎フレーム更新） */
   loosePath: { x: number; z: number; h: number; t: number }[] = [];
+  /**
+   * 表示用: リング・ボードにボールが当たった出来事（z = どちらのゴールか、sim の座標の符号 / speed = 当たった速さ m/s）。
+   * 描画側が読んだら空にする（揺れの演出だけに使い、sim の判定には使わない）
+   */
+  impacts: { z: number; part: "rim" | "board"; speed: number }[] = [];
   /** ジャンプボール中のジャンパー（弾くまで他は触れない） */
   private jb: { a: Player; b: Player; tapped: boolean; offA: number; offB: number } | null = null;
   private nextPoss: Team = 0;
@@ -206,10 +212,18 @@ export class Game {
   shotPosAt(dt: number): V3 {
     const b = this.ball;
     if (b.k !== "shot") { const bp = this.ballPos(); return { x: bp.p.x, y: bp.h, z: bp.p.z }; }
-    const s = clamp((b.t + dt) / b.T, 0, 1);
+    const q = this.shotAt(b, b.t + dt);
+    return { x: q.p.x, y: q.h, z: q.p.z };
+  }
+
+  /**
+   * シュートの t 秒後の位置: リリース点からリング（指先で触れられたら逸れた先）の 0.1m 上へ、
+   * 飛行時間 T の重力の放物線。水平は空気抵抗で手元ほど速い。
+   */
+  private shotAt(b: Extract<BallState, { k: "shot" }>, t: number): { p: V2; h: number } {
     const end = add(RIM, b.dev);
-    const p = lerpV(b.p0, end, s);
-    return { x: p.x, y: lerp(b.h0, COURT.rimH + 0.1, s) + 4 * b.apex * s * (1 - s) * 0.5, z: p.z };
+    const u = clamp(t / b.T, 0, 1);
+    return { p: lerpV(b.p0, end, passFrac(u, dist(b.p0, end))), h: ballistic(b.h0, COURT.rimH + 0.1, u * b.T, b.T) };
   }
 
   /** ルーズボールの軌道の予測（重力・床・ボード）。dt=1/30 */
@@ -338,7 +352,7 @@ export class Game {
   update(dt: number): void {
     this.t += dt;
     this.phaseT += dt;
-    for (const p of this.players) { p.effort = 0.25; p.urgency = 0.2; p.bendCmd = 0; }
+    for (const p of this.players) { p.effort = 0.25; p.urgency = 0.2; p.bendCmd = 0; p.trunkCmd = 0; p.twistCmd = 0; p.protecting = false; p.postUp = false; }
 
     if (this.phase === "gameover") {
       for (const p of this.players) { p.vCmd = null; p.tgt = p.p; p.update(dt); }
@@ -414,6 +428,7 @@ export class Game {
     for (const p of this.players) {
       const res = p.update(dt);
       if (res === 2) this.onFall(p);
+      else if (res === 3) this.onStagger(p);
       else if (res === 1 && this.phase === "live") this.onBreak(p);
     }
     this.contactPairs = resolveContacts(this.players, this.contactPairs, (a, b, vrel) => this.onContact(a, b, vrel), (w, l) => this.onShove(w, l), dt);
@@ -427,6 +442,14 @@ export class Game {
     if (p.team !== this.offTeam && this.phase === "live") this.stats[this.offTeam].breaks++;
     // ボールを持っていたらこぼす
     if (this.holder() === p) this.fumble(p);
+  }
+
+  /** 転倒しそうなほど崩れたが、ふらついて踏みとどまった（ボールは持ったまま） */
+  private onStagger(p: Player): void {
+    p.say("ふらつく", 1.0);
+    this.log(`${this.tag(p)} がふらつく（${p.fallWhy || "重心が大きく外れた"}）— 踏みとどまれるか`, "break", p.team);
+    const h = this.holder();
+    if (p.team !== this.offTeam && h && this.phase === "live") this.stats[this.offTeam].breaks++;
   }
 
   private onBreak(p: Player): void {
@@ -500,24 +523,21 @@ export class Game {
         return { p: { x: hb.x, z: hb.z }, h: hb.y };
       }
       case "pass": {
-        const s = clamp(b.t / b.T, 0, 1);
-        const h = passHeight(b.style, b.h0, b.h1, s, b.L);
-        return { p: lerpV(b.p0, b.p1, s), h };
+        // 重力の放物線＋空気抵抗（水平は手元ほど速い）
+        const u = clamp(b.t / b.T, 0, 1);
+        return { p: lerpV(b.p0, b.p1, passFrac(u, b.L)), h: passHeight(b.style, b.h0, b.h1, u, b.T) };
       }
-      case "shot": {
-        const s = clamp(b.t / b.T, 0, 1);
-        // 指先で触れられたシュートは着地点が逸れる
-        const end = add(RIM, b.dev);
-        return { p: lerpV(b.p0, end, s), h: lerp(b.h0, COURT.rimH + 0.1, s) + 4 * b.apex * s * (1 - s) * 0.5 };
-      }
+      case "shot":
+        return this.shotAt(b, b.t);
       case "loose":
         return { p: b.p, h: b.h };
       case "dead":
         return { p: b.p, h: b.h };
       case "inbound": {
-        const s = clamp(b.t / b.T, 0, 1);
+        const u = clamp(b.t / b.T, 0, 1);
         const tp = b.to.ballHand();
-        return { p: lerpV(b.p0, { x: tp.x, z: tp.z }, s), h: lerp(b.h0, tp.y, s) + 1.2 * s * (1 - s) };
+        const L = dist(b.p0, { x: tp.x, z: tp.z });
+        return { p: lerpV(b.p0, { x: tp.x, z: tp.z }, passFrac(u, L)), h: ballistic(b.h0, tp.y, u * b.T, b.T) };
       }
     }
   }
@@ -530,7 +550,12 @@ export class Game {
       case "inbound":
         b.t += dt;
         if (b.t >= b.T) {
+          const tp = b.to.ballHand();
+          const L = dist(b.p0, { x: tp.x, z: tp.z });
+          const dir = dirTo(b.p0, { x: tp.x, z: tp.z });
+          const vh = passHSpeed(1, L, b.T);
           this.ball = { k: "held", owner: b.to };
+          b.to.catchGive({ x: dir.x * vh, y: ballisticVy(b.h0, tp.y, b.T, b.T), z: dir.z * vh });
           this.off.onCatch(b.to, null);
         }
         return;
@@ -545,6 +570,10 @@ export class Game {
           const handOk = Math.min(dist3(r.handW(0), B), dist3(r.handW(1), B)) < 0.6;
           if ((handOk || dist(r.p, b.p1) < 0.7) && !r.bal.off) {
             this.ball = { k: "held", owner: r };
+            // ボールの勢いを手で受ける（手が押し込まれ、体にも運動量）
+            const dir = norm({ x: b.p1.x - b.p0.x, z: b.p1.z - b.p0.z });
+            const vh = passHSpeed(1, b.L, b.T);
+            r.catchGive({ x: dir.x * vh, y: passVy(b.style, b.h0, b.h1, 1, b.T), z: dir.z * vh });
             this.off.onCatch(r, b.from);
           } else {
             const dir = norm({ x: b.p1.x - b.p0.x, z: b.p1.z - b.p0.z });
@@ -565,20 +594,29 @@ export class Game {
       case "dead":
         if (b.vy !== undefined && b.v) {
           b.vy -= 9.8 * dt;
-          // ネットの中: 網に擦れて落ちる速さが抑えられ、リムの中心へ寄せられて下の口から抜ける
-          const inNet = distRim(b.p) < COURT.rimR + 0.05 && b.h < COURT.rimH + 0.05 && b.h > COURT.rimH - NET.len;
-          if (inNet) {
-            // 網の広いところ（ボールより太い）は普通に落ち、網がボールより細くなる所で絞られて急に遅くなる
-            const depth = clamp((COURT.rimH - b.h) / NET.len, 0, 1);
-            const rAt = lerp(COURT.rimR, NET.rBottom, depth);
-            if (rAt < BALL_R) {
-              b.vy = Math.max(b.vy, -0.9);
-              b.v = mul(b.v, Math.exp(-dt * 12));
-            }
-            b.p = lerpV(b.p, RIM, Math.min(1, dt * 5));
-          }
           b.h += b.vy * dt;
           b.p = madd(b.p, b.v, dt);
+          // ネットの中: 網は下ほど細い円すいの袋。ボールの中心は網の内側（網の半径 − ボールの半径）から出られない。
+          // 網に当たったら外向きの勢いを網が受け止め（少し押し返す）、擦れて横も縦も遅くなる。
+          // 網がボールより細くなる所（下の口の近く）では絞られて落ちる速さが抑えられ、下の口から真下へ抜ける。
+          const depth = COURT.rimH - b.h;
+          const rNet = netRadiusAt(depth);
+          if (rNet > 0 && distRim(b.p) < COURT.rimR + 0.2) {
+            const allow = Math.max(0, rNet - BALL_R);
+            const off = sub(b.p, RIM);
+            const d = len(off);
+            if (d > allow) {
+              const nrm = d > 1e-6 ? mul(off, 1 / d) : V(0, 1);
+              b.p = madd(RIM, nrm, allow);
+              const vout = dot(b.v, nrm);
+              if (vout > 0) b.v = madd(b.v, nrm, -vout * 1.3);
+              b.v = mul(b.v, Math.exp(-dt * 6));
+              if (b.vy < -1.5) b.vy += (-1.5 - b.vy) * (1 - Math.exp(-dt * 6));
+            }
+            // 網全体が揺れて横の勢いを吸う
+            b.v = mul(b.v, Math.exp(-dt * 8));
+            if (rNet - NET_STRETCH < BALL_R && b.vy < -0.9) b.vy += (-0.9 - b.vy) * (1 - Math.exp(-dt * 18));
+          }
           if (b.h < 0.12) {
             b.h = 0.12;
             b.vy = b.vy < 0 ? -b.vy * 0.55 : b.vy;
@@ -648,16 +686,24 @@ export class Game {
       t: 0, lob, style: lane.style, L: dist(lane.pts[0], lane.target), tried: new Set(), lane: lane.kind, open: lane.open,
     };
     from.dribbling = false;
+    // フォロースルー: 投げた向きへ上半身を傾け、戻すまで次の動きに移れない（遠くへ投げるほど深く・長く）
+    from.followThrough(dirTo(from.p, lane.target), dist(from.p, lane.target), false);
     const kindTxt = lane.kind === "lob" ? (lane.endH > 3 ? "アリウープのロブ" : "ロブパス") : lane.kind === "lead" ? `リードの${PASS_LABEL[lane.style]}` : PASS_LABEL[lane.style];
     this.log(`${this.tag(from)} → ${this.tag(to)} ${kindTxt}（導線 ${(lane.open * 100).toFixed(0)}%）`, "pass", from.team);
   }
 
-  releaseShot(s: Player, open: number, type: ShotType): void {
+  /** forced = 押し込めず無理に打った（背負ったマークにブロックされやすい） */
+  releaseShot(s: Player, open: number, type: ShotType, forced = false): void {
     if (!s.airborne) s.landT = Math.max(s.landT, 0.3);
+    // フォロースルー: リングの方へ上半身を傾ける（遠いシュートほど深く・長く）。ミドルは大きめ
+    const mid = !isThree(s.p) && dist(s.p, RIM) > 2.8;
+    s.followThrough(dirTo(s.p, RIM), dist(s.p, RIM), true, mid ? 1.4 : 1);
     const base = shotBase(s, s.p);
     let p = pMakeType(s, s.p, open, type);
     // リリース点の目の前に手があれば精度が落ちる（ハンド・イン・フェイス）
-    const R = s.ballHand();
+    // 無理に打つ（マークを背負ったまま）と腕を伸ばしきれず、リリースが0.3m低い
+    const R0 = s.ballHand();
+    const R = forced ? { x: R0.x, y: R0.y - 0.3, z: R0.z } : R0;
     let face = 9;
     for (const d of this.defense) for (let i = 0; i < 2; i++) face = Math.min(face, dist3(d.handW(i), R));
     if (face < 0.7) p *= 0.82 + 0.18 * (face / 0.7);
@@ -668,10 +714,11 @@ export class Game {
     const L = dist(s.p, RIM);
     // 打ち方ごとの飛び方: ダンクは叩き込む／レイアップは低く／フローターは高く山なり／外は放物線
     // ジャンプシュート・セットシュートの頂点はリリース点とリングを結ぶ線より 0.35+0.23×距離 上（3Pで約2m＝地上約5m）
-    const peak = 0.35 + 0.23 * L;
-    const T = type === "dunk" ? 0.12 : type === "layup" ? 0.35 : type === "floater" ? clamp(0.6 + L * 0.08, 0.6, 0.95) : clamp(2 * Math.sqrt((2 * peak) / 9.8), 0.7, 1.45);
-    const apex = type === "dunk" ? 0 : type === "layup" ? 0.4 : type === "floater" ? 1.6 + 0.3 * L : 2 * peak;
-    this.ball = { k: "shot", by: s, p0: { x: R.x, z: R.z }, h0: R.y, T, t: 0, made, pts: base.pts, open, tried: new Set(), rim: type === "dunk" || type === "layup" || type === "floater", apex, type, dev: V(), tipped: false };
+    // 飛行時間は「頂点がリリース点とリングを結ぶ線より peak 上」になる重力の放物線から（T = 2√(2·peak/g)）。
+    // フローターは高く（0.8+0.15×距離）。ダンク・レイアップは短く低い
+    const peak = type === "floater" ? 0.8 + 0.15 * L : 0.35 + 0.23 * L;
+    const T = type === "dunk" ? 0.12 : type === "layup" ? 0.35 : type === "floater" ? clamp(2 * Math.sqrt((2 * peak) / G), 0.6, 1.2) : clamp(2 * Math.sqrt((2 * peak) / G), 0.7, 1.45);
+    this.ball = { k: "shot", by: s, p0: { x: R.x, z: R.z }, h0: R.y, T, t: 0, made, pts: base.pts, open, tried: new Set(), rim: type === "dunk" || type === "layup" || type === "floater", type, dev: V(), tipped: false, forced };
     const kindTxt = SHOT_LABEL[type] + (base.pts === 3 ? "(3P)" : "");
     this.log(`${this.tag(s)} ${kindTxt}（導線 ${(open * 100).toFixed(0)}% / 成功率 ${(p * 100).toFixed(0)}%）`, "info", s.team);
     this.afterShotRelease(s, false);
@@ -682,15 +729,37 @@ export class Game {
     this.def.onShot(s);
   }
 
+  /** 表示用の当たりを記録（描画が読まないとき＝ヘッドレス等でも溜まり続けないよう最新16件まで） */
+  private impact(e: { z: number; part: "rim" | "board"; speed: number }): void {
+    this.impacts.push(e);
+    if (this.impacts.length > 16) this.impacts.shift();
+  }
+
   private resolveShot(b: Extract<BallState, { k: "shot" }>): void {
     const team = b.by.team;
+    // リングへ来たときの速さ（放物線の終わりの速度）
+    {
+      const end = add(RIM, b.dev);
+      const vh = passHSpeed(1, dist(b.p0, end), b.T);
+      const vy = ballisticVy(b.h0, COURT.rimH + 0.1, b.T, b.T);
+      const sp = Math.hypot(vh, vy);
+      // 外れはリングに当たる。ダンクはリングを叩く。入るシュートも時々リングをかすって入る
+      if (!b.made) this.impact({ z: RIM.z, part: "rim", speed: sp });
+      else if (b.type === "dunk") this.impact({ z: RIM.z, part: "rim", speed: 14 });
+      else if (this.rng.chance(0.3)) this.impact({ z: RIM.z, part: "rim", speed: sp * 0.3 });
+    }
     if (b.made) {
       this.score[team] += b.pts;
       this.stats[team].fgm++;
       if (b.pts === 3) this.stats[team].tpm++;
       this.log(`${this.tag(b.by)} 成功 +${b.pts}  ${this.names[0]} ${this.score[0]} - ${this.score[1]} ${this.names[1]}`, "score", team);
-      // リムの中からネットへ落ちる（飛んできた向きの勢いが少し残る）
-      this.ball = { k: "dead", p: copy(RIM), h: COURT.rimH - 0.02, v: mul(dirTo(b.p0, RIM), 0.5), vy: -2.6 };
+      // 飛んできた勢いのまま（重力の放物線の終わりの速度で）リングの中へ。横の勢いは網が受け止める
+      const end = add(RIM, b.dev);
+      const L = dist(b.p0, end);
+      this.ball = {
+        k: "dead", p: copy(end), h: COURT.rimH + 0.1,
+        v: mul(dirTo(b.p0, end), passHSpeed(1, L, b.T)), vy: ballisticVy(b.h0, COURT.rimH + 0.1, b.T, b.T),
+      };
       this.endPossession((1 - team) as Team, "made", baselineInbound(this.rng.sign()), 24);
       return;
     }
@@ -715,7 +784,9 @@ export class Game {
    */
   private checkBlock(b: Extract<BallState, { k: "shot" }>): void {
     const s = b.t / b.T;
-    if (s > (b.rim ? 0.7 : 0.42)) return;
+    // 無理に打ったシュートは、背負ったマークがすぐそばに居てボールが上がりきる前に触れやすい（判定の区間も長い）
+    if (s > (b.rim || b.forced ? 0.7 : 0.42)) return;
+    const blockR = b.forced ? 0.3 : 0.22;
     const bp = this.ballPos();
     const B: V3 = { x: bp.p.x, y: bp.h, z: bp.p.z };
     for (const d of this.defense) {
@@ -723,13 +794,15 @@ export class Game {
       let hi = -1, hd = 9;
       for (let i = 0; i < 2; i++) {
         const di = dist3(d.handW(i), B);
-        if (di < 0.22 && di < hd) { hd = di; hi = i; }
+        // 無理に打ったシュートは密着したマークの手・体に触れやすい（届く範囲 0.22→0.3m）
+        if (di < blockR && di < hd) { hd = di; hi = i; }
       }
       if (hi < 0) continue;
       b.tried.add(d.id);
       // 当たりの強さ: 手のどこに当たったか × ブロックの上手さ × ボールがまだ上がっているか
       const rising = s < (b.rim ? 0.45 : 0.3);
-      const q = clamp((1 - hd / 0.22) * (0.55 + 0.45 * n(d.a.block)) * (rising ? 1 : 0.7) * (0.85 + 0.3 * this.rng.next()) - 0.1 * n(b.by.a.release), 0, 1);
+      // 無理に打ったシュートは体勢が悪く、当たればしっかりブロックされやすい（+0.3）
+      const q = clamp((1 - hd / blockR) * (0.55 + 0.45 * n(d.a.block)) * (rising ? 1 : 0.7) * (0.85 + 0.3 * this.rng.next()) - 0.1 * n(b.by.a.release) + (b.forced ? 0.3 : 0), 0, 1);
       const hw = d.handW(hi);
       const swing = norm(add(dirTo({ x: hw.x, z: hw.z }, bp.p), mul(d.f, 0.6)));
 
@@ -778,6 +851,7 @@ export class Game {
     const za = z0 * sg, zb = b.p.z * sg;
     if (Math.abs(b.p.x) < BOARD.halfW + BR && b.h > BOARD.y0 - BR && b.h < BOARD.y1 + BR) {
       if (za <= BOARD.z - BR && zb > BOARD.z - BR) {
+        this.impact({ z: sg, part: "board", speed: Math.hypot(b.v.z, b.vy) });
         b.p = { x: b.p.x, z: (BOARD.z - BR) * sg };
         b.v = { x: b.v.x * 0.8, z: -Math.abs(b.v.z) * 0.6 * sg };
         b.vy = Math.max(b.vy, 0) * 0.7 + 0.6;
@@ -842,7 +916,8 @@ export class Game {
       if (b.h < 1.6 && b.vy < 0) { this.jb.tapped = true; this.phase = "live"; this.shotClock = 24; }
       return;
     }
-    if (b.t < 0.15) return;
+    // はじかれて上がっている最中のボールは誰もつかめない（落ち始めてから保持か競り合いかが決まる）
+    if (b.t < Math.max(0.15, b.grabAfter ?? 0)) return;
     // 手がボールに触れた人が取る（触れている手の数・近さ・リバウンド能力）
     const B: V3 = { x: b.p.x, y: b.h, z: b.p.z };
     let best: Player | null = null;
@@ -867,6 +942,8 @@ export class Game {
     let rival: Player | null = null;
     for (const q of this.players) {
       if (q.team === best.team || q.fallen) continue;
+      // まだ触れない人（奪い取られた直後のハンドラー等）は競り合いにならない
+      if (b.noGrab === q.id && b.t < (b.noGrabT ?? 0)) continue;
       if (Math.min(dist3(q.handW(0), B), dist3(q.handW(1), B)) < 0.35) { rival = q; break; }
     }
     let pCatch = 1;
@@ -885,6 +962,12 @@ export class Game {
       return;
     }
     const team = best.team;
+    // ハンドラーからはたいたボールを守備側が確保したらスティール（攻撃側が拾い直せばターンオーバーではない）
+    if (b.stripBy !== undefined && team !== this.offTeam) {
+      this.stats[team].stl++;
+      this.stats[this.offTeam].to++;
+      this.log(`${this.tag(best)} がボールを確保（スティール）`, "to", team);
+    }
     this.ball = { k: "held", owner: best };
     if (this.phase !== "live" && this.phase !== "throwin") return;
     if (team === this.offTeam) {
@@ -895,29 +978,57 @@ export class Game {
       this.off.onRegain(best);
       this.def.onRegain();
     } else {
-      this.log(`${this.tag(best)} がボール確保`, "info", team);
-      this.changeLive(team, this.lastWasShot ? "守備リバウンド" : "ルーズボール");
+      if (b.stripBy === undefined) this.log(`${this.tag(best)} がボール確保`, "info", team);
+      this.changeLive(team, b.stripBy !== undefined ? "スティール" : this.lastWasShot ? "守備リバウンド" : "ルーズボール");
     }
   }
 
-  /** オンボールのスティール */
-  tryStrip(d: Player, h: Player, exposure: number): boolean {
-    const p = clamp(0.1 + 0.35 * n(d.a.steal) * exposure - 0.15 * n(h.a.handle), 0.02, 0.5);
+  /** オンボールのスティール。sd = 選んで手を出したスティールの強さ（無ければ構えたまま手が触れただけ） */
+  tryStrip(d: Player, h: Player, exposure: number, sd?: StealDef): boolean {
+    const p = sd ? stripChance(sd, d, h, exposure) : clamp(0.1 + 0.35 * n(d.a.steal) * exposure - 0.15 * n(h.a.handle), 0.02, 0.5);
     if (this.rng.chance(p)) {
-      const dir = norm(add(dirTo(h.p, d.p), V((this.rng.next() - 0.5), (this.rng.next() - 0.5))));
-      this.ball = { k: "loose", p: copy(h.handPos()), v: mul(dir, 2.5), h: 0.6, vy: 0.5, t: 0, lastTouch: d.team };
-      d.say("スティール！", 1.2);
+      // 守備者の手がボールに当たり、ボールがハンドラーの手から離れる（コントロールを失う）。
+      // ボールはロブパスのような山なりで上・横へはじかれる。向きは腕の当たり方で決まる:
+      //   当たった面の向き（手→ボール）6割 ＋ 腕の振りの向き（肩→手）4割。
+      //   下から当たれば高く上へ、横から当たれば横へ低めの山なりに（上向きは必ず少しある＝山なり）。
+      // そのあと守備者が保持するか、はじいたボールのまま追いかけ合うかは、ルーズボールの確保の判定で動きの中で決まる。
+      const bp = this.ballPos();
+      const B: V3 = { x: bp.p.x, y: bp.h, z: bp.p.z };
+      const hi = dist3(d.handW(0), B) <= dist3(d.handW(1), B) ? 0 : 1;
+      const hw = d.handW(hi), sh = d.shoulder(hi);
+      const unit3 = (x: number, y: number, z: number) => { const l = Math.hypot(x, y, z) || 1; return { x: x / l, y: y / l, z: z / l }; };
+      const nrm = unit3(B.x - hw.x, B.y - hw.y, B.z - hw.z);
+      const arm = unit3(hw.x - sh.x, hw.y - sh.y, hw.z - sh.z);
+      const dir = unit3(nrm.x * 0.6 + arm.x * 0.4, nrm.y * 0.6 + arm.y * 0.4, nrm.z * 0.6 + arm.z * 0.4);
+      // 上へ: 頂点の高さ 0.9m（横から・上から当たった）〜 2.0m（真下から当たった）。ロブのようにはっきり上がる
+      const up = clamp((dir.y + 1) / 2, 0, 1);
+      const apex = 0.9 + 1.1 * up * up;
+      // 横へ: 当たった向きの水平成分の強さ。弱（つつく）は強く、強（体ごと）は弱く。スティールが上手いほど柔らかい
+      const lvK = sd?.lv === "strong" ? 0.8 : sd?.lv === "mid" ? 1.0 : 1.2;
+      const hLen = Math.hypot(dir.x, dir.z);
+      const hdir = hLen > 1e-3 ? V(dir.x / hLen, dir.z / hLen) : dirTo(d.p, bp.p);
+      const hs = (1.0 + 2.6 * Math.min(1, hLen)) * lvK * (1.15 - 0.3 * n(d.a.steal)) * (0.85 + 0.3 * this.rng.next());
+      const vy0 = Math.sqrt(2 * G * apex);
+      this.ball = {
+        k: "loose", p: copy(bp.p), v: mul(hdir, hs), h: bp.h, vy: vy0, t: 0,
+        lastTouch: d.team, noGrab: h.id, noGrabT: 0.35, stripBy: d.id,
+        // 頂点を過ぎるまで（上がる時間の9割）は誰もつかめない＝山なりにはじかれるのが見える
+        grabAfter: (vy0 / G) * 0.9,
+      };
+      // 守備者は伸ばした腕をそのまま残してボールを追う。ハンドラーは手を払われて体が少し揺れる
+      d.lungeT = Math.max(d.lungeT, 0.3);
+      h.bal.kick(mul(dirTo(d.p, h.p), 0.5));
       this.lastWasShot = false;
-      this.log(`${this.tag(d)} が ${this.tag(h)} からボールをはたいた`, "to", d.team);
-      this.stats[d.team].stl++;
-      this.stats[h.team].to++;
+      this.log(`${this.tag(d)} の手が ${this.tag(h)} のボールに当たった`, "to", d.team);
       this.off.onLoose();
       this.def.onLoose();
       return true;
     }
-    // 空振り: 手を伸ばしたぶん前へ体重が流れる
-    d.bal.kick(mul(dirTo(d.p, h.p), 1.4));
-    d.say("リーチ空振り", 0.8);
+    // 取りきれなかった: 選んだスティールなら守備側（stealFailed）が強さに応じて体を流す。触れただけなら少し流れる
+    if (!sd) {
+      d.bal.kick(mul(dirTo(d.p, h.p), 1.4));
+      d.say("リーチ空振り", 0.8);
+    }
     return false;
   }
 

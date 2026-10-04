@@ -26,7 +26,10 @@ const groups: Btn[][] = [
   ([["handler", "導線"], ["all", "導線+守備"], ["off", "導線なし"]] as [LaneMode, string][]).map(([m, l]) => ({
     label: l, on: () => view.laneMode === m, act: () => { view.laneMode = m; },
   })),
-  [{ label: "重心", on: () => view.showBalance, act: () => { view.showBalance = !view.showBalance; }, title: "支持円と重心 (B)" }],
+  [
+    { label: "重心", on: () => view.showBalance, act: () => { view.showBalance = !view.showBalance; }, title: "支持円と重心 (B)" },
+    { label: "名前", on: () => view.showLabels, act: () => { view.showLabels = !view.showLabels; }, title: "頭の上の背番号・ポジション・今やっていること (N)" },
+  ],
   ([["side", "斜め"], ["top", "真上"], ["behind", "正面"], ["follow", "追従"]] as [CamMode, string][]).map(([m, l]) => ({
     label: l, on: () => view.camMode === m, act: () => view.setCam(m),
   })),
@@ -59,6 +62,7 @@ window.addEventListener("keydown", (e) => {
   else if (e.key >= "1" && e.key <= "5") speed = [0.25, 0.5, 1, 2, 4][Number(e.key) - 1];
   else if (e.key === "l" || e.key === "L") view.laneMode = view.laneMode === "handler" ? "all" : view.laneMode === "all" ? "off" : "handler";
   else if (e.key === "b" || e.key === "B") view.showBalance = !view.showBalance;
+  else if (e.key === "n" || e.key === "N") view.showLabels = !view.showLabels;
   else if (e.key === "c" || e.key === "C") {
     const order: CamMode[] = ["side", "top", "behind", "follow"];
     view.setCam(order[(order.indexOf(view.camMode) + 1) % order.length]);
@@ -69,13 +73,15 @@ window.addEventListener("keydown", (e) => {
 // ---------------------------------------------------------------- HUD
 
 const STYLE_SHORT: Record<string, string> = { chest: "チェスト", bounce: "バウンズ", overhead: "頭上", lob: "ロブ", jump: "ジャンプ" };
-const KIND_LABEL: Record<string, string> = { shoot: "シュート", drive: "ドライブ", pass: "パス", lead: "リード", lob: "ロブ", hold: "保持" };
+const KIND_LABEL: Record<string, string> = { shoot: "シュート", drive: "ドライブ", pass: "パス", lead: "リード", lob: "ロブ", step: "ステップ", post: "押し込み", hold: "保持" };
 
 function optRow(o: Option, best: boolean): string {
   const open = o.lane ? o.lane.open : 1;
   const col = open < 0.5 ? `rgb(242,${Math.round(51 + open * 332)},38)` : `rgb(${Math.round(242 - (open - 0.5) * 383)},217,51)`;
   let name = KIND_LABEL[o.kind];
   if (o.lane && (o.kind === "pass" || o.kind === "lead")) name = (o.kind === "lead" ? "リード" : "") + STYLE_SHORT[o.lane.style];
+  // ステップ: 左右はハンドラーから見た向き（s=+1 が右）。→ 着地してからの狙い
+  if (o.step) name = (o.step.id === "stepback" ? "Sバック" : o.step.s > 0 ? "右ステップ" : "左ステップ") + (o.step.follow === "shoot" ? "→撃" : "→抜");
   if (o.to) name += ` →#${o.to.d.num}`;
   return `<div class="row${best ? " best" : ""}"><span>${esc(name)}</span>` +
     `<span class="bar"><i style="width:${(open * 100).toFixed(0)}%;background:${col}"></i></span>` +

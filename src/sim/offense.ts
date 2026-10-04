@@ -8,9 +8,9 @@ import { SHOT_LABEL, ShotType, chooseShotType, contValue, finishPoint, holdValue
 import { COURT } from "./court";
 import type { Game } from "./game";
 import { Lane, LaneCtx, PASS_LABEL, bestPassLane, driveLane, passLane, passMinOpen, shotLane } from "./lanes";
-import { V, V2, add, copy, dirTo, dist, dot, len, madd, mul, norm, right, sub } from "./math";
-import { CutInfo, Option, bestOf, evalOptions, receiveValue } from "./options";
-import { Player, Team } from "./player";
+import { V, V2, add, angleBetween, clamp, copy, dirTo, dist, dot, len, madd, mul, norm, right, rot, sub } from "./math";
+import { CutInfo, Option, StepPlan, bestOf, evalOptions, receiveValue } from "./options";
+import { PASS_ARC, Player, TWIST_MAX, Team } from "./player";
 import { CallId, Play, chooseCall, createPlay } from "./plays";
 import { Obstacle } from "./reach";
 import { CUT_RATE, offRole, rimCrowd, roleSpots } from "./roles";
@@ -54,7 +54,8 @@ export interface HState {
   catchT: number;
   move: ActiveMove | null;
   drive: { path: V2[]; i: number; t: number; re: number; force: boolean } | null;
-  shooting: { t: number; rel: number; jumped: boolean; type: ShotType } | null;
+  /** forced = 押し込めず無理に打つ（マークを背負ったまま＝ブロックされやすい） */
+  shooting: { t: number; rel: number; jumped: boolean; type: ShotType; forced?: boolean } | null;
   passing: { t: number; rel: number; lane: Lane; jumped?: boolean } | null;
   decideT: number;
   lastMoveT: number;
@@ -66,11 +67,17 @@ export interface HState {
   holdT: number;
   /** 手渡し（DHO）の相手 */
   handoffTo: Player | null;
+  /** ステップ導線で始めたムーブの見込み（着地後の判断のログ用） */
+  stepPlan: StepPlan | null;
+  /** 押し込みドリブル中（経過・前回確認したリムまでの距離・確認までの時間・パスを見直すまでの時間） */
+  post: { t: number; lastD: number; checkT: number; re: number } | null;
+  /** 押し込みに失敗した時刻（すぐに同じ押し込みを繰り返さない） */
+  postFailT: number;
 }
 
 const newHState = (t: number): HState => ({
   dribbled: false, catchT: t, move: null, drive: null, shooting: null, passing: null, decideT: 0.15,
-  lastMoveT: -9, goal: null, goalI: 0, lastPasser: null, lastPassT: -9, holdT: 0, handoffTo: null,
+  lastMoveT: -9, goal: null, goalI: 0, lastPasser: null, lastPassT: -9, holdT: 0, handoffTo: null, stepPlan: null, post: null, postFailT: -9,
 });
 
 export class Offense {
@@ -451,12 +458,12 @@ export class Offense {
     if (hs.passing) {
       hs.passing.t += dt;
       ib.face = dirTo(ib.p, hs.passing.lane.target);
-      if (hs.passing.t >= hs.passing.rel) {
+      if (hs.passing.t >= hs.passing.rel && ib.canPassTo(dirTo(ib.p, hs.passing.lane.target))) {
         const lane = hs.passing.lane;
         hs.passing = null;
         g.throwPass(ib, lane);
         this.ibThrown = true;
-        this.setSpot(ib, this.freeSpot(ib));
+        if (lane.to) this.afterPass(ib, lane.to);
       }
       return;
     }
@@ -508,27 +515,32 @@ export class Offense {
     const s = this.stOf(p);
     s.mode = "spot";
     s.path = null;
-    if (from) {
-      // 渡したあと: ギブ&ゴー（自分のマークがボールを見ていればカット）かリロケート
-      const fs = this.stOf(from);
-      const fd = this.defOf(from);
-      const rimPath = [from.p, madd(RIM, dirTo(RIM, from.p), 1.0)];
-      const fdBlocks = fd ? dot(dirTo(from.p, fd.p), dirTo(from.p, RIM)) > 0.3 : false;
-      const watch = fd ? !fdBlocks && dot(fd.f, dirTo(fd.p, p.p)) > 0.5 && dist(fd.p, from.p) > 1.0 : true;
-      const clear = rimCrowd(this.pl, from) === 0 && !this.pl.some((o) => o !== from && (this.stOf(o).mode === "cut" || this.stOf(o).mode === "roll"));
-      if (!fs.scripted && watch && clear && distRim(from.p) > 4 && from.p.z > 0 && this.g.rng.chance(CUT_RATE[offRole(from)] * (0.25 + 0.4 * n(from.a.offIQ)))) {
-        this.setCut(from, rimPath, false, 1.5, "ギブ&ゴー");
-        fs.scripted = false;
-      } else {
-        // 元の持ち場が自陣側／遠い（攻守交代でボールを取った地点のまま等）なら、前のコートの役割の持ち場へ。遠ければ走る
-        const stale = fs.home.z < 0 || dist(fs.home, from.p) > 7;
-        const spot = stale ? this.freeSpot(from) : fs.home;
-        this.setSpot(from, spot, false);
-        if (dist(from.p, spot) > 6) {
-          this.setCut(from, [spot], false, 1.5, "走る", "cut", spot);
-          this.stOf(from).scripted = false;
-        }
-      }
+  }
+
+  /**
+   * パスを投げた瞬間: 投げた人の次の動き（ギブ&ゴーかリロケート）を決める。
+   * キャッチまで待つと、飛んでいる間は「ボールを受ける前の古い持ち場」へ戻ろうとしてしまう（2026-10-04 修正）。
+   */
+  private afterPass(from: Player, to: Player): void {
+    const fs = this.stOf(from);
+    const fd = this.defOf(from);
+    const rimPath = [from.p, madd(RIM, dirTo(RIM, from.p), 1.0)];
+    const fdBlocks = fd ? dot(dirTo(from.p, fd.p), dirTo(from.p, RIM)) > 0.3 : false;
+    // 自分のマークが受け手（ボール）を見ていればカット
+    const watch = fd ? !fdBlocks && dot(fd.f, dirTo(fd.p, to.p)) > 0.5 && dist(fd.p, from.p) > 1.0 : true;
+    const clear = rimCrowd(this.pl, from) === 0 && !this.pl.some((o) => o !== from && (this.stOf(o).mode === "cut" || this.stOf(o).mode === "roll"));
+    if (!fs.scripted && watch && clear && distRim(from.p) > 4 && from.p.z > 0 && this.g.rng.chance(CUT_RATE[offRole(from)] * (0.25 + 0.4 * n(from.a.offIQ)))) {
+      this.setCut(from, rimPath, false, 1.5, "ギブ&ゴー");
+      fs.scripted = false;
+      return;
+    }
+    // 元の持ち場が自陣側／遠い（攻守交代でボールを取った地点のまま等）なら、前のコートの役割の持ち場へ。遠ければ走る
+    const stale = fs.home.z < 0 || dist(fs.home, from.p) > 7;
+    const spot = stale ? this.freeSpot(from, to) : fs.home;
+    this.setSpot(from, spot, false);
+    if (dist(from.p, spot) > 6) {
+      this.setCut(from, [spot], false, 1.5, "走る", "cut", spot);
+      this.stOf(from).scripted = false;
     }
   }
 
@@ -675,7 +687,7 @@ export class Offense {
         hs.shooting = null;
         const lane = shotLane(this.lc(), h, h.p, 0, 0, releaseHeight(h, sh.type));
         h.vCmd = null;
-        g.releaseShot(h, lane.open, sh.type);
+        g.releaseShot(h, lane.open, sh.type, sh.forced ?? false);
       }
       return;
     }
@@ -685,12 +697,19 @@ export class Offense {
       if (pa.lane.style === "jump" && !pa.jumped) { pa.jumped = true; h.jump(0.6, 0.35); }
       h.urgency = 0.7;
       h.vCmd = mul(h.v, 0.85);
-      h.face = dirTo(h.p, pa.lane.target);
-      if (pa.t >= pa.rel) {
+      // 足の向きはそのまま、上半身をひねって投げる向きへ。ひねりきっても真横に入らない分だけ足を回す
+      const dir = dirTo(h.p, pa.lane.target);
+      const aF = angleBetween(h.f, dir);
+      const over = Math.abs(aF) - PASS_ARC - TWIST_MAX;
+      h.face = over > 0 ? rot(h.f, Math.sign(aF) * (over + 0.05)) : h.f;
+      h.twistCmd = clamp(aF, -TWIST_MAX, TWIST_MAX);
+      // パスは上半身の前から真横までしか出せない（向ききるまで待つ）
+      if (pa.t >= pa.rel && h.canPassTo(dir)) {
         hs.passing = null;
         h.vCmd = null;
         g.throwPass(h, pa.lane);
         this.hs.lastPassT = g.t;
+        if (pa.lane.to) this.afterPass(h, pa.lane.to);
       }
       return;
     }
@@ -700,29 +719,85 @@ export class Offense {
         const m = hs.move;
         hs.move = null;
         hs.decideT = 0;
+        const plan = hs.stepPlan;
+        hs.stepPlan = null;
         if (m.def.shot) {
-          // ムーブの終わり: シュートとパス（ダンプオフ／キックアウト）を期待値で比べる
+          // ムーブの終わり: シュートとパス（ダンプオフ／キックアウト）、ステップならそこからの突破も期待値で比べる
           const opts = this.evaluate(h, C);
           const pass = this.okPass(h, bestPass(opts), C);
           const shoot = bestOf(opts, "shoot")!;
-          if (pass && pass.value > shoot.value + 0.03) { this.execute(h, pass); return; }
-          if ((shoot.lane?.open ?? 0) > 0.35 || m.def.id === "euro" || g.shotClock < 3) { this.startShot(h, false); return; }
+          if (m.def.id === "stepback" || m.def.id === "sidestep") {
+            if (this.afterStep(h, m.def.label, opts, shoot, pass, C, plan)) return;
+          } else {
+            if (pass && pass.value > shoot.value + 0.03) { this.execute(h, pass); return; }
+            if ((shoot.lane?.open ?? 0) > 0.35 || m.def.id === "euro" || g.shotClock < 3) { this.startShot(h, false); return; }
+          }
         }
       } else return;
     }
     if (hs.drive) {
       if (this.driveStep(h, dt, C)) return;
     }
+    if (hs.post) {
+      if (this.postStep(h, dt, C)) return;
+    }
+
+    // キープ: 受けた直後（0.6秒）でなければボールを守れる（突破中・ムーブ中・パスやシュートの構え中はここまで来ない）
+    const keep = g.t - hs.catchT > 0.6;
+    h.protecting = keep;
 
     hs.decideT -= dt;
     const od = this.onBallDef(h);
     if (od && (od.airborne || od.bal.off) && hs.decideT > 0) hs.decideT = 0;
     if (hs.decideT > 0) {
+      if (keep && this.protectBall(h)) return;
       this.holdOrGoal(h, dt);
       return;
     }
     hs.decideT = 0.16 - 0.06 * n(h.a.offIQ);
     this.decide(h, C);
+  }
+
+  /**
+   * キープ: スティールを狙われたら（守備者が手の届く間合いまで詰めた・手を出してきた）、ボールを守備者から遠い側の手に持ち替え、
+   * ドリブル中なら下がるか左右へずれて間合いを取る（守備者たちから最も離れられる所。バックコート・ラインへは行かない）。
+   * まだドリブルしていない（トリプルスレット）なら足は動かせないので、体の陰にボールを置くだけ。狙われていなければ false。
+   */
+  private protectBall(h: Player): boolean {
+    const g = this.g;
+    let d: Player | null = null;
+    let dd = 9;
+    for (const x of g.defense) {
+      const k = dist(x.p, h.p);
+      if (k < dd) { dd = k; d = x; }
+    }
+    if (!d || d.bal.off || d.airborne) return false;
+    const reach = h.radius + d.radius + d.armLen + 0.6;
+    if (!(d.lungeT > 0 || dd < reach)) return false;
+    // ボールを守備者から遠い側の手へ（右手 = +1）
+    const dSide = dot(right(h.f), dirTo(h.p, d.p));
+    if (this.hs.dribbled) h.hand = dSide > 0 ? -1 : 1;
+    if (!this.hs.dribbled) return true;
+    const away = dirTo(d.p, h.p);
+    const lat = right(away);
+    const cands = [madd(h.p, away, 1.2), madd(h.p, lat, 1.0), madd(h.p, lat, -1.0)]
+      .map((q) => inCourt(q, 0.8))
+      .filter((q) => q.z > 1.0);
+    if (cands.length === 0) return true;
+    let best = cands[0], bs = -1e9;
+    for (const q of cands) {
+      let m = 9;
+      for (const x of g.defense) m = Math.min(m, dist(x.p, q));
+      if (m > bs) { bs = m; best = q; }
+    }
+    h.vCmd = null;
+    h.tgt = best;
+    h.spd = 0.75;
+    h.urgency = 0.8;
+    h.stanceCmd = 0.5;
+    h.face = dirTo(h.p, RIM);
+    if (h.labelT <= 0) h.say("キープ", 0.6);
+    return true;
   }
 
   /** ボールを運ぶ段階なら、許すパス（ハンドラーへ／逃がす／速攻）だけ通す */
@@ -778,7 +853,7 @@ export class Offense {
   private evaluate(h: Player, C: number): Option[] {
     const catchShoot = !this.hs.dribbled && this.g.t - this.hs.catchT < 1.2;
     const opts = evalOptions({
-      lc: this.lc(), h, mates: this.receivers(h), cuts: this.cuts(), catchShoot, C, onBall: this.onBallDef(h), holdT: this.holdTime(),
+      lc: this.lc(), h, mates: this.receivers(h), cuts: this.cuts(), catchShoot, C, onBall: this.onBallDef(h), holdT: this.holdTime(), shotClock: this.g.shotClock,
     });
     this.options = opts;
     return opts;
@@ -838,6 +913,21 @@ export class Offense {
       if (fd && (adv > -0.02 || rd?.tight)) {
         cands.push({ o: fd, v: H + 0.04 + 0.35 * Math.max(0, adv) + 0.1 * fd.lane!.open + (rd?.tight ? 0.05 : 0) + jit(), force: true });
       }
+    }
+    // 押し込みドリブル: パワーで勝っていれば、マークを背中で押してゴール下へ（ドリブルが下手でも着実に進める）
+    // 力が同じか負けていても試みる: ビッグ（C/PF・役割 big）はゴール下へ近づく手段として、価値が持ち続ける価値に届かなくても候補に。
+    // それ以外は価値で判断。押し込みに失敗した直後（3秒）は繰り返さない
+    const post = bestOf(opts, "post");
+    if (post?.lane && !this.bringingUp(h) && g.t - hs.postFailT > 3) {
+      const big = h.d.pos === "C" || h.d.pos === "PF" || offRole(h) === "big";
+      if (post.value > H * 1.02 + 0.02) cands.push({ o: post, v: post.value + jit() });
+      else if (big) cands.push({ o: post, v: H + 0.03 + jit() });
+    }
+    // ステップ導線: 左右・後ろへステップしてマークをずらす（着地してシュート、またはそれを見せて突破）
+    const step = bestOf(opts, "step");
+    if (step?.lane && step.step && md && !this.bringingUp(h) && g.t - hs.lastMoveT > 0.6 &&
+      step.lane.open >= 0.4 && step.value > H * 1.03 + 0.02) {
+      cands.push({ o: step, v: step.value + jit() });
     }
     // ショットクロックが無い: 何でもいいから撃つ／投げる
     if (g.shotClock < 2.5 && cands.length === 0) cands.push({ o: shoot, v: 1 });
@@ -905,12 +995,13 @@ export class Offense {
     return inside ? s : -s;
   }
 
-  private beginMove(h: Player, id: MoveId, s: number): void {
+  /** fixedSide: ステップ導線で向きと着地点を決めてある（ライン際の向きの入れ替えをしない）。note はログに足す説明 */
+  private beginMove(h: Player, id: MoveId, s: number, fixedSide = false, note = ""): void {
     const g = this.g;
     // ライン際では外へ向かうムーブをしない（下がるムーブはセンターライン際では使わない）
     if (id === "retreat" && h.p.z < -COURT.baseZ + 2.5) return;
-    if (id === "stepback" && distRim(h.p) > 8.2) return;
-    s = this.sideAwayFromLine(h, s);
+    if (id === "stepback" && (h.p.z < 1.8 || (!fixedSide && distRim(h.p) > 8.2))) return;
+    if (!fixedSide) s = this.sideAwayFromLine(h, s);
     const def = MOVES[id];
     const risk = Math.max(0, def.diff - n(h.a.handle)) * 0.25 + (h.bal.off ? 0.15 : 0);
     if (g.rng.chance(risk * 0.4)) { g.fumble(h); return; }
@@ -920,7 +1011,39 @@ export class Offense {
     this.hs.holdT = 0;
     this.lastMoveLabel = def.label;
     const d = this.onBallDef(h);
-    g.log(`${g.tag(h)} ${def.label}${d ? ` vs ${g.tag(d)}` : ""}`, "move", h.team);
+    g.log(`${g.tag(h)} ${def.label}${note}${d ? ` vs ${g.tag(d)}` : ""}`, "move", h.team);
+  }
+
+  /**
+   * ステップ（サイドステップ／ステップバック）の着地: その場のシュート・パス・そこからの突破を期待値で比べる。
+   * 撃つ構えに守備者が詰めてきた／跳んだ／崩れたなら突破の導線が開いている（ステップをフェイクにして抜く）。
+   * 何も開いていなければ false（次の判断へ）。
+   */
+  private afterStep(h: Player, label: string, opts: Option[], shoot: Option, pass: Option | null, C: number, plan: StepPlan | null): boolean {
+    const g = this.g;
+    const H = holdValue(h, C, this.holdTime());
+    const md = this.onBallDef(h);
+    const rd = md ? readDefender(h, md) : null;
+    const bit = !!rd && (rd.air || rd.off || rd.closing);
+    const drive = bestOf(opts, "drive");
+    const sv = (shoot.lane?.open ?? 0) > 0.35 && shoot.value >= H * 0.95 ? shoot.value : -1;
+    const dv = drive?.lane && drive.lane.open >= (bit ? 0.3 : 0.5) ? drive.value + (bit ? 0.1 : 0) : -1;
+    const pv = pass ? pass.value : -1;
+    const best = Math.max(sv, dv, pv);
+    if (best < 0) {
+      if (g.shotClock < 3) { this.startShot(h, false); return true; }
+      return false;
+    }
+    if (pass && pv === best) { this.execute(h, pass); return true; }
+    if (drive && dv === best) {
+      this.execute(h, drive);
+      const why = bit && md ? `（${g.tag(md)} が${rd!.air ? "跳んだ" : rd!.off ? "崩れた" : "詰めた"}）` : "";
+      g.log(`${g.tag(h)} ${label}${plan?.follow === "shoot" ? "からのシュート" : ""}を見せて突破${why}`, "move", h.team);
+      h.say(`${label}→突破`, 1.0);
+      return true;
+    }
+    this.startShot(h, false);
+    return true;
   }
 
   /** 1on1で押し込めるか: スピードの優位とパワー（筋力×体重）の優位の大きい方 */
@@ -946,6 +1069,23 @@ export class Offense {
         h.say(PASS_LABEL[lane.style], 0.8);
         return;
       }
+      case "step": {
+        const sp = o.step!;
+        hs.stepPlan = sp;
+        this.beginMove(h, sp.id, sp.s, true, `でずらす（狙い: ${sp.follow === "shoot" ? "シュート" : "突破"} 導線 ${((o.lane?.open ?? 0) * 100).toFixed(0)}%）`);
+        if (!hs.move) hs.stepPlan = null;
+        return;
+      }
+      case "post": {
+        hs.dribbled = true;
+        hs.drive = null;
+        hs.goal = null;
+        hs.post = { t: 0, lastD: distRim(h.p), checkT: 0, re: 0.2 };
+        h.say("押し込み", 1.0);
+        const d = o.lane?.closer;
+        g.log(`${g.tag(h)} 押し込みドリブル（押し勝ち ${((o.lane?.speed ?? 0) / 1.8 * 100).toFixed(0)}% / 導線 ${((o.lane?.open ?? 0) * 100).toFixed(0)}%）${d ? ` vs ${g.tag(d)}` : ""}`, "move", h.team);
+        return;
+      }
       case "drive": {
         hs.dribbled = true;
         hs.drive = { path: o.path!.map(copy), i: 1, t: 0, re: 0.1, force };
@@ -966,14 +1106,98 @@ export class Offense {
     h.say(label, 1.0);
   }
 
-  startShot(h: Player, catchShoot: boolean): void {
+  startShot(h: Player, catchShoot: boolean, forced = false): void {
     // 今どれだけ空いているかで打ち方を選ぶ
     const sl = shotLane(this.lc(), h, h.p, 0, releaseTime(h, h.p, catchShoot));
     const type = chooseShotType(h, h.p, sl.open);
-    this.hs.shooting = { t: 0, rel: shotTypeRel(h, h.p, catchShoot, type), jumped: false, type };
+    this.hs.shooting = { t: 0, rel: shotTypeRel(h, h.p, catchShoot, type), jumped: false, type, forced };
     this.hs.drive = null;
     this.hs.move = null;
     h.say(SHOT_LABEL[type] + (isThree(h.p) ? "(3P)" : ""), 1.0);
+  }
+
+  /**
+   * 押し込みドリブル中: ゴールに背を向け（顔はリングと逆）、リングの方へ下がりながらマークを背中で押す。
+   * 実際に進めるかは押し合いの物理（contact.ts）次第。ゴール下（リングまで1.7m）に着いたら振り向いてシュート（レイアップ・ダンク）。
+   * 1秒ごとに進み具合を確かめ、0.15m も進めていなければ（押し返されている）やめて次の判断へ。
+   * 0.2秒ごとにパスを見直し、ヘルプが寄って味方が空けばパス。5秒かショットクロック残り1.5秒でシュート。
+   */
+  private postStep(h: Player, dt: number, C: number): boolean {
+    const g = this.g;
+    const ps = this.hs.post!;
+    ps.t += dt;
+    const d = this.onBallDef(h);
+    const toRim = dirTo(h.p, RIM);
+    h.postUp = true;
+    h.protecting = true;
+    h.dribbling = true;
+    h.effort = 1;
+    h.urgency = 1;
+    h.stanceCmd = 0.9;
+    h.face = mul(toRim, -1);
+    h.vCmd = mul(toRim, 1.6);
+    // ボールはマークから遠い側の手で
+    if (d) h.hand = dot(right(h.f), dirTo(h.p, d.p)) > 0 ? -1 : 1;
+    const dr = distRim(h.p);
+    if (dr < 1.7) {
+      this.hs.post = null;
+      h.vCmd = null;
+      g.log(`${g.tag(h)} ゴール下まで押し込んで振り向く`, "move", h.team);
+      this.startShot(h, false);
+      return true;
+    }
+    // 0.5秒ごとに進み具合を確認。8cm 未満（止められている）か押し戻されていたら、早々に見切る
+    ps.checkT += dt;
+    if (ps.checkT >= 0.5) {
+      const gain = ps.lastD - dr;
+      ps.checkT = 0;
+      ps.lastD = dr;
+      if (gain < 0.08) {
+        this.hs.post = null;
+        this.hs.postFailT = g.t;
+        h.vCmd = null;
+        const back = gain < 0;
+        g.log(`${g.tag(h)} 押し込めない（${d ? g.tag(d) : "マーク"} が${back ? "押し返す" : "踏ん張る"}）`, "def", h.team);
+        // 味方へ早々にパス（多少危なくても出せる導線＝開き0.25以上の中で 開き×価値 が最も良いもの）。
+        // 無ければ、背負ったまま無理にシュート（リリースが低く、ブロックされやすい）
+        const opts = this.evaluate(h, C);
+        let pass: Option | null = null;
+        for (const o of opts) {
+          if ((o.kind !== "pass" && o.kind !== "lead" && o.kind !== "lob") || !o.lane || o.lane.open < 0.25) continue;
+          if (!this.okPass(h, o, C)) continue;
+          if (!pass || o.lane.open * o.value > pass.lane!.open * pass.value) pass = o;
+        }
+        if (pass) {
+          h.say(back ? "押し返された→パス" : "押し込めない→パス", 1.0);
+          this.execute(h, pass);
+          return true;
+        }
+        h.say(back ? "押し返された→無理に打つ" : "押し込めない→無理に打つ", 1.0);
+        this.startShot(h, false, true);
+        return true;
+      }
+    }
+    ps.re -= dt;
+    if (ps.re <= 0) {
+      ps.re = 0.2;
+      const opts = this.evaluate(h, C);
+      const pass = this.okPass(h, bestPass(opts), C);
+      const keep = bestOf(opts, "post")?.value ?? C;
+      if (pass && pass.value > keep + 0.05) {
+        this.hs.post = null;
+        h.vCmd = null;
+        this.execute(h, pass);
+        g.log(`${g.tag(h)} 押し込みにヘルプが寄る → パス`, "pass", h.team);
+        return true;
+      }
+    }
+    if (ps.t > 5 || g.shotClock < 1.5) {
+      this.hs.post = null;
+      h.vCmd = null;
+      this.startShot(h, false);
+      return true;
+    }
+    return true;
   }
 
   /** ドライブ中。続けるなら true */
@@ -1227,9 +1451,8 @@ export class Offense {
     }
   }
 
-  /** 空いている外周のスポット */
-  freeSpot(p: Player): V2 {
-    const h = this.handler();
+  /** 空いている外周のスポット。h = ボールを持つ人（パスが飛んでいる間は受け手を渡す） */
+  freeSpot(p: Player, h: Player | null = this.handler()): V2 {
     let best = SPOT.top();
     let bs = -1e9;
     for (const q of roleSpots(offRole(p), h ? h.p : null)) {

@@ -1,7 +1,7 @@
 // パスへのスティール。パスの導線に対して「ダッシュ → 腕を伸ばして飛び込む(ランジ) → 弾く/確保」。
 // 空振りすれば重心が前へ流れて立て直しが要る（ギャンブルの代償）。
 import { n } from "./attrs";
-import { LUNGE_REACH, PassStyle, passHeight } from "./lanes";
+import { LUNGE_REACH, PassStyle, passFrac, passHeight } from "./lanes";
 import { V2, clamp, lerpV } from "./math";
 import { Player } from "./player";
 import { timeToReach } from "./reach";
@@ -38,12 +38,12 @@ export function planIntercept(d: Player, b: BallPath, lag: number): Intercept | 
   for (let i = 1; i <= 12; i++) {
     const s = s0 + (1 - s0) * (i / 12);
     if (s < 0.12) continue;
-    const h = passHeight(b.style, b.h0, b.h1, s, b.L);
+    const h = passHeight(b.style, b.h0, b.h1, s, b.T);
     let r = d.handReachAt(h, true);
     let extra = 0;
     if (r < 0 && h < d.shoulderY) { r = d.handReachLow(h); extra = 0.15; }
     if (r < 0) continue;
-    const X = lerpV(b.p0, b.p1, s);
+    const X = lerpV(b.p0, b.p1, passFrac(s, b.L));
     const tb = b.wait + s * b.T - b.t;
     const td = timeToReach(d, X, r + LUNGE_REACH * 0.8) + lag + extra;
     if (td < tb - 0.02) return { X, h, margin: tb - td, tb };

@@ -77,11 +77,14 @@ export const MOVES: Record<MoveId, MoveDef> = {
     id: "stepback", label: "ステップバック", dur: 0.5, diff: 0.55, shot: true,
     vel: (u, s) => (ph(u, 0.3) ? [0.5, 0] : [-0.85, s * 0.15]),
     sellLat: () => 0,
+    // 下がりきる手前から「撃つ」構えを見せる（詰めてくる守備者の逆を突いて突破にもつなげる）
+    sellShot: (u) => (u > 0.6 ? 0.8 : 0),
   },
   sidestep: {
     id: "sidestep", label: "サイドステップ", dur: 0.45, diff: 0.5, shot: true,
     vel: (u, s) => (ph(u, 0.25) ? [0.2, -s * 0.2] : [0, s * 0.9]),
     sellLat: (u, s) => (ph(u, 0.25) ? -s * 0.6 : 0),
+    sellShot: (u) => (u > 0.65 ? 0.8 : 0),
   },
   spin: {
     id: "spin", label: "スピンムーブ", dur: 0.6, diff: 0.6, switchAt: 0.45, push: 1.2,
@@ -109,6 +112,24 @@ export interface ActiveMove {
   t: number;
   axis: V2;
   lat: V2;
+}
+
+/**
+ * ムーブで進む量の目安 [前(axis), 横(lat)] m。ムーブの速度の形を積分したもの（加速の制限ぶん 0.8 掛け）。
+ * ステップ導線（options.ts）が着地点を見積もるのに使う。
+ */
+export function moveDisp(h: Player, id: MoveId, s: number): [number, number] {
+  const def = MOVES[id];
+  const sp = h.speedNow() * (0.65 + 0.35 * n(h.a.handle));
+  const N = 20;
+  let f = 0, l = 0;
+  for (let i = 0; i < N; i++) {
+    const [a, b] = def.vel((i + 0.5) / N, s);
+    f += a;
+    l += b;
+  }
+  const k = (sp * def.dur * 0.8) / N;
+  return [f * k, l * k];
 }
 
 export function startMove(h: Player, id: MoveId, s: number, toward: V2): ActiveMove {
@@ -152,6 +173,8 @@ export function exposure(h: Player, m: ActiveMove | null, d: Player): number {
     const u = m.t / m.def.dur;
     if (u >= m.def.exposed[0] && u <= m.def.exposed[1]) e = Math.max(e, 0.9);
   }
+  // キープ中（下がる・ずれる・体の陰の手でボールを守っている）は出方が小さい
+  if (h.protecting) e *= 0.12;
   return e * (1 - 0.5 * n(h.a.handle));
 }
 
@@ -316,4 +339,52 @@ export function chooseMove(h: Player, d: Player, triple: boolean, others: Player
   }
   if (ids.length === 0) return null;
   return rng.weighted(ids, w);
+}
+
+// ---------------------------------------------------------------------------
+// オンボールのスティール（弱・中・強）。守備者は「取れたときの得」と「失敗して導線を開けてしまう損」を比べて選ぶ。
+
+export type StealLv = "weak" | "mid" | "strong";
+
+export interface StealDef {
+  lv: StealLv;
+  label: string;
+  /** 手を伸ばす長さの追加 [m]（届く範囲の見積もり用。実際の接触は手の位置で判定） */
+  reach: number;
+  /** 飛び込み（腕が伸び、肩が前へ出る）の長さ [s] */
+  lungeT: number;
+  /** 踏み込む距離 [m] */
+  step: number;
+  /** 失敗したとき体が流れて構え直すまでの時間 [s]（この間、抑えていた導線が開く） */
+  commit: number;
+  /** 失敗したとき重心が前へ流れる強さ [m/s]（大きいと崩れ・ふらつきになる） */
+  kick: number;
+  /** はたき落とせる確率: base + k·スティール能力·ボールの出方 − hk·相手のハンドリング */
+  base: number;
+  k: number;
+  hk: number;
+}
+
+export const STEALS: Record<StealLv, StealDef> = {
+  // 弱: 構えたまま手だけ出してつつく。ほとんど崩れないが取れることは少ない
+  weak: { lv: "weak", label: "チェック", reach: 0.0, lungeT: 0.12, step: 0, commit: 0.15, kick: 0.35, base: 0.04, k: 0.22, hk: 0.1 },
+  // 中: 一歩踏み込んで手を伸ばす（従来のリーチイン）
+  mid: { lv: "mid", label: "リーチイン", reach: 0.35, lungeT: 0.28, step: 0.45, commit: 0.4, kick: 1.1, base: 0.1, k: 0.35, hk: 0.15 },
+  // 強: 体ごと飛び込んで奪いにいく。取れれば大きいが、外せば完全に置いていかれる
+  strong: { lv: "strong", label: "ギャンブル", reach: 0.75, lungeT: 0.45, step: 0.9, commit: 0.75, kick: 1.9, base: 0.18, k: 0.5, hk: 0.15 },
+};
+
+/** 手がボールに触れたときにはたき落とせる確率 */
+export function stripChance(sd: StealDef, d: Player, h: Player, exposure: number): number {
+  return clamp(sd.base + sd.k * n(d.a.steal) * exposure - sd.hk * n(h.a.handle), 0.02, 0.65);
+}
+
+/**
+ * 手を出す前の成功率の見積もり = ボールに手が届く見込み × はたき落とせる確率。
+ * 届く見込みは「体の半径＋腕＋踏み込み・飛び込み」と、ボールまでの距離から。ボールが自分の側に出ているほど触りやすい。
+ */
+export function stealSuccessEstimate(sd: StealDef, d: Player, h: Player, ball: V2, exposure: number): number {
+  const reachMax = d.radius + 0.04 + d.armLen + sd.reach;
+  const contact = clamp((reachMax + 0.15 - dist(d.p, ball)) / 0.3, 0, 1) * (0.4 + 0.6 * exposure);
+  return contact * stripChance(sd, d, h, exposure);
 }

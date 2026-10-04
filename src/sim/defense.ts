@@ -4,7 +4,7 @@
 // カバレッジ（コールへの対抗）は「スクリーンに関わる守備者の台本」と「最適化の重み」を変える。
 import { n } from "./attrs";
 import { RIM, distRim, inCourt } from "./court";
-import { exposure, onBallDefend } from "./duel";
+import { STEALS, StealDef, exposure, onBallDefend, stealSuccessEstimate } from "./duel";
 import { contValue } from "./eval";
 import type { Game, BallState } from "./game";
 import { LaneCtx } from "./lanes";
@@ -19,7 +19,13 @@ import type { Lane } from "./lanes";
 import type { V3 } from "./player";
 
 /** 跳んでから最高点までの時間（コンテストは最高点がリリースに重なるように跳ぶ） */
-const jumpApexT = (d: Player): number => Math.sqrt((2 * d.jumpH * 0.91) / 9.8);
+/** 全力で跳んだときの最高点までの時間 */
+const jumpApexT = (d: Player): number => Math.sqrt((2 * d.jumpH) / 9.8);
+/**
+ * シュートのコンテストで跳ぶか: 最高点が「ボールが手を離れた少し後（0.1秒）」に来るように跳ぶ（ブロックできるのはボールが上がっていく間）。
+ * ただしシュートの動きが見えてから（反応の遅れの7割）でないと跳べない。
+ */
+const contestJumpNow = (d: Player, t: number, rel: number): boolean => t >= Math.max(d.reactT * 0.7, rel + 0.1 - jumpApexT(d));
 
 /** ビッグ（C/PF/身長2.03m以上）: トランジションではボールを止めに行かず、リムを守りに戻る */
 const isBig = (p: Player): boolean => p.d.pos === "C" || p.d.pos === "PF" || p.a.height >= 2.03;
@@ -36,7 +42,9 @@ export class Defense {
   private tgt = new Map<Player, V2>();
   private stealCd = new Map<Player, number>();
   /** リーチインで手を出している期限 */
-  private reachUntil = new Map<Player, number>();
+  private reaching = new Map<Player, { sd: StealDef; until: number; tgt: V2 }>();
+  /** オンボールのスティールを考える次の時刻 */
+  private stealDecideT = new Map<Player, number>();
   private passRef: BallState | null = null;
   private icpt = new Map<Player, V2>();
   /** パスを取りに行っている守備者（読んだ点・高さ・飛び込んだか・期限） */
@@ -324,7 +332,7 @@ export class Defense {
         if (d.airborne || d.bal.off || dist(d.p, h.p) > 1.9) continue;
         d.tgt = madd(h.p, dirTo(h.p, d.p), 0.55);
         d.face = dirTo(d.p, h.p);
-        if (sh.t + d.reactT * 0.5 >= sh.rel - jumpApexT(d)) d.jump(0.6, 0.2);
+        if (contestJumpNow(d, sh.t, sh.rel)) d.jump(0.66, 0.2);
       }
     }
     return true;
@@ -580,6 +588,16 @@ export class Defense {
       scripted.add(hd);
       // ドライブに体を当てて止める
       hd.effort = 0.7;
+      // 押し込みドリブルには体を密着させて押し返す（ハンドラーとリングの間、少しハンドラーへ食い込む所を目指す＝押す意思）
+      if (off.hs.post && !hd.bal.off) {
+        const toRim = dirTo(h.p, RIM);
+        hd.tgt = madd(h.p, toRim, h.radius + hd.radius - 0.15);
+        hd.face = dirTo(hd.p, h.p);
+        hd.effort = 1;
+        hd.urgency = 1;
+        hd.stanceCmd = 0.8;
+        hd.leanCmd = V();
+      }
       const cat = hd.guardFocus > 0.35 ? 1 : hd.guardFocus < -0.35 ? -1 : 0;
       if (this.focusShown.get(hd) !== cat) {
         this.focusShown.set(hd, cat);
@@ -606,8 +624,8 @@ export class Defense {
         d.tgt = madd(h.p, dirTo(h.p, d.p), 0.55);
         d.face = dirTo(d.p, h.p);
         d.urgency = 1;
-        if (sh.t + d.reactT * 0.5 >= sh.rel - jumpApexT(d)) {
-          d.jump(0.6, 0.2);
+        if (contestJumpNow(d, sh.t, sh.rel)) {
+          d.jump(0.66, 0.2);
           d.say("コンテスト", 0.7);
         }
         scripted.add(d);
@@ -743,30 +761,74 @@ export class Defense {
   }
 
   /**
-   * リーチイン: 間合い1.5m以内でボールが自分の側に出ている（クロスオーバーの持ち替えの瞬間など）とき、
-   * スティール能力に応じた頻度で一歩踏み込みながら腕を伸ばす。手が触れれば tryStrip、空振りは体重が前へ流れる。
+   * オンボールのスティールを選択肢として選ぶ（弱=チェック／中=リーチイン／強=ギャンブル、duel.ts の STEALS）。
+   * 0.17〜0.25秒ごとに、それぞれ
+   *   得 = 成功の見込み ×（今の攻撃の脅威 + 速攻0.3）
+   *   損 = 失敗の見込み ×（失敗して「構え直し＋崩れの立て直し」の時間だけ自分が遅れたときに増える攻撃の脅威）
+   * を導線で計算し（遅れは導線の到達時間に足す＝抑えていたドリブル・パスの導線が開く）、得−損が最大の強さで手を出す。
+   * 守備IQが低いほど成功の見込みを高く見積もる（ギャンブルしがち）。
    */
-  private reachIn(d: Player, h: Player, dt: number): void {
+  private reachIn(d: Player, h: Player, _dt: number): void {
     const g = this.g;
-    // 手を出して届かずに終わった → 体重が前へ流れる（抜かれる隙）
-    const ru = this.reachUntil.get(d);
-    if (ru !== undefined && g.t > ru) {
-      this.reachUntil.delete(d);
-      d.bal.kick(mul(dirTo(d.p, h.p), 1.1 * (1 - 0.4 * n(d.a.balance))));
-      d.say("空振り", 0.7);
+    const r = this.reaching.get(d);
+    if (r) {
+      if (g.t > r.until) {
+        // 手を出して届かずに終わった
+        this.reaching.delete(d);
+        this.stealFailed(d, h, r.sd, "空振り");
+      } else {
+        // 手を出している最中: 踏み込み・飛び込みを続ける
+        d.tgt = r.tgt;
+        d.urgency = 1;
+        if (r.sd.lv === "strong") d.vCmd = mul(dirTo(d.p, r.tgt), d.maxSpeed * 0.8);
+      }
+      return;
     }
-    if (d.bal.off || d.airborne || d.lungeT > 0 || g.phase !== "live" || g.off.hs.shooting || g.off.hs.passing) return;
-    if (dist(d.p, h.p) > 1.5 || g.t < (this.stealCd.get(d) ?? 0)) return;
+    if (d.bal.off || d.airborne || d.lungeT > 0 || d.commitT > 0 || g.phase !== "live" || g.off.hs.shooting || g.off.hs.passing) return;
+    if (dist(d.p, h.p) > 2.2 || g.t < (this.stealCd.get(d) ?? 0) || g.t < (this.stealDecideT.get(d) ?? 0)) return;
+    this.stealDecideT.set(d, g.t + 0.25 - 0.08 * n(d.a.defIQ));
     const e = exposure(h, g.off.hs.move, d);
-    if (e < 0.3) return;
-    const rate = (0.2 + 0.9 * n(d.a.steal)) * e * (1.25 - 0.5 * n(d.a.defIQ));
-    if (!g.rng.chance(rate * dt)) return;
-    d.lungeT = 0.28;
-    const bp = g.ballPos();
-    d.tgt = madd(d.p, dirTo(d.p, bp.p), 0.45);
-    d.say("手を出す", 0.6);
+    const bp = g.ballPos().p;
+    const lc: LaneCtx = { defs: this.pl, screens: g.off.screens() };
+    const base = {
+      lc, h, mates: g.off.receivers(h), cuts: g.off.cuts(), catchShoot: false,
+      C: contValue(g.shotClock), onBall: d, coarse: true, holdT: g.off.holdTime(),
+    };
+    const opts0 = evalOptions(base);
+    const now = threatOf(opts0);
+    const gain = now + 0.3;
+    const over = 1 + 0.6 * (1 - n(d.a.defIQ));
+    let best: StealDef | null = null;
+    let bestEV = 0.02, bestP = 0, bestCost = 0;
+    for (const sd of Object.values(STEALS)) {
+      const p = Math.min(0.95, stealSuccessEstimate(sd, d, h, bp, e) * over);
+      if (p < 0.01) continue;
+      const lag = sd.commit + 0.18 * sd.kick;
+      const opts1 = evalOptions({ ...base, lc: { ...lc, delay: new Map([[d, lag]]) } });
+      // 損: 攻撃の脅威（全選択肢のなめらかな最大）の増加 ＋ 失敗で一番良くなる選択肢の伸びの半分。
+      // 脅威は「攻め続ける価値」に近い選択肢が多いと薄まり、空振りでフリーのシュートが生まれても小さく見える（2026-10-04 計測で中央値+0.05）ため
+      let jump = 0;
+      for (let i = 0; i < Math.min(opts0.length, opts1.length); i++) jump = Math.max(jump, opts1[i].value - opts0[i].value);
+      const cost = Math.max(0, threatOf(opts1) - now) + 0.5 * jump;
+      const ev = p * gain - (1 - p) * cost;
+      if (ev > bestEV) { bestEV = ev; best = sd; bestP = p; bestCost = cost; }
+    }
+    if (!best) return;
+    d.lungeT = best.lungeT;
+    const tgt = best.step > 0 ? madd(d.p, dirTo(d.p, bp), best.step) : d.p;
+    this.reaching.set(d, { sd: best, until: g.t + best.lungeT + 0.07, tgt });
     this.stealCd.set(d, g.t + 0.9);
-    this.reachUntil.set(d, g.t + 0.35);
+    d.say(best.label, 0.7);
+    const lvTxt = best.lv === "weak" ? "弱" : best.lv === "mid" ? "中" : "強";
+    // 弱（チェック）は頻繁なのでログに出さない（頭の上の表示だけ）
+    if (best.lv !== "weak") g.log(`${g.tag(d)} ${best.label}（${lvTxt}: 成功見込み ${(bestP * 100).toFixed(0)}% / 失敗で脅威 +${bestCost.toFixed(2)}）`, "def", this.team);
+  }
+
+  /** スティールの失敗: 重心が前へ流れ（強さは種類ごと）、構え直すまで遅い＝抑えていた導線が開く */
+  private stealFailed(d: Player, h: Player, sd: StealDef, why: string): void {
+    d.bal.kick(mul(dirTo(d.p, h.p), sd.kick * (1 - 0.4 * n(d.a.balance))));
+    d.commitT = Math.max(d.commitT, sd.commit);
+    d.say(`${sd.label}${why}`, 0.8);
   }
 
   private tryStrip(d: Player, h: Player, dt: number): void {
@@ -777,12 +839,13 @@ export class Defense {
     const B = { x: bp.p.x, y: bp.h, z: bp.p.z };
     if (Math.min(dist3(d.handW(0), B), dist3(d.handW(1), B)) > 0.24) return;
     const e = exposure(h, g.off.hs.move, d);
-    // リーチインで手を出している最中に触れたら必ず判定（1回）、そうでなければ低い頻度で
-    const reaching = g.t < (this.reachUntil.get(d) ?? 0);
-    if (reaching) {
-      this.reachUntil.delete(d);
+    // スティールで手を出している最中に触れたら必ず判定（1回）、そうでなければ低い頻度で
+    const r = this.reaching.get(d);
+    if (r) {
+      this.reaching.delete(d);
       this.stealCd.set(d, g.t + 1.2);
-      g.tryStrip(d, h, Math.max(e, 0.5));
+      // 手を出して触れたら出方は最低0.5とみなす（ただしキープして守っているボールにはこの下限をかけない）
+      if (!g.tryStrip(d, h, h.protecting ? e : Math.max(e, 0.5), r.sd)) this.stealFailed(d, h, r.sd, "取りきれず");
       return;
     }
     if (g.t < (this.stealCd.get(d) ?? 0)) return;

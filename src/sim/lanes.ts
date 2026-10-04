@@ -7,8 +7,9 @@ import { passRelease, passSpeed } from "./eval";
 import { V2, alongPoly, clamp, dirTo, dist, dot, len, lerp, lerpV, madd, polyLen, sat } from "./math";
 import { Player } from "./player";
 import { Obstacle, runTime, timeToReach } from "./reach";
+import { POST_PUSH_SPEED, pushPower } from "./contact";
 
-export type LaneKind = "pass" | "lead" | "lob" | "drive" | "shot";
+export type LaneKind = "pass" | "lead" | "lob" | "drive" | "shot" | "step" | "post";
 
 export interface Lane {
   kind: LaneKind;
@@ -43,17 +44,63 @@ export interface LaneCtx {
   screens: Obstacle[];
   /** 守備の最適化用: 仮想位置 */
   virt?: Map<Player, V2>;
+  /** 評価用: 守備者ごとの追加の遅れ（スティールに失敗したら導線がどれだけ開くか、の見積もり） */
+  delay?: Map<Player, number>;
 }
 
-function defAt(c: LaneCtx, d: Player): { at?: V2; still?: boolean } {
+function defAt(c: LaneCtx, d: Player): { at?: V2; still?: boolean; delay?: number } {
   const at = c.virt?.get(d);
-  return at ? { at, still: true } : {};
+  const delay = c.delay?.get(d);
+  return at ? { at, still: true, delay } : { delay };
 }
 
-/** ロブの高さの形 */
-export function lobHeight(h0: number, h1: number, s: number, L: number): number {
+// ---------------------------------------------------------------- ボールの飛び方（重力＋空気抵抗）
+// パス・シュートは「飛行時間 T で水平に L 進み、高さ h0 → h1」を、重力と空気抵抗に従って飛ぶ。
+// u = 飛行時間の割合（t/T）。水平に進んだ割合は passFrac(u, L)（手元ほど速く、先ほど空気抵抗で遅い）、
+// 高さは重力の放物線（ballistic）。導線の評価・ボールの位置・表示・手の狙いがすべてこの関数を使う。
+
+export const G = 9.8;
+/** 空気抵抗（速さの2乗に比例する減速）の係数 [1/m] ≈ 0.5·空気密度1.2·Cd0.5·断面積0.045m²/質量0.62kg */
+export const BALL_DRAG = 0.022;
+
+/** 飛行時間の割合 u で水平に進んだ割合（x(t) = ln(1 + k·v0·t)/k、L 進むのに T 秒になる v0） */
+export function passFrac(u: number, L: number): number {
+  const kL = BALL_DRAG * L;
+  const uu = clamp(u, 0, 1);
+  if (kL < 1e-4) return uu;
+  return Math.log(1 + (Math.exp(kL) - 1) * uu) / kL;
+}
+
+/** 水平に割合 s 進んだときの飛行時間の割合（passFrac の逆） */
+export function fracToU(s: number, L: number): number {
+  const kL = BALL_DRAG * L;
+  if (kL < 1e-4) return s;
+  return (Math.exp(kL * s) - 1) / (Math.exp(kL) - 1);
+}
+
+/** 水平の速さ [m/s]（飛行時間の割合 u のとき） */
+export function passHSpeed(u: number, L: number, T: number): number {
+  const kL = BALL_DRAG * L;
+  if (kL < 1e-4) return L / T;
+  const e = Math.exp(kL) - 1;
+  return ((L / T) * e) / (kL * (1 + e * clamp(u, 0, 1)));
+}
+
+/** 重力で h0 から T 秒後に h1 に着く放物線の、t 秒後の高さ */
+export function ballistic(h0: number, h1: number, t: number, T: number): number {
+  const vy0 = (h1 - h0 + 0.5 * G * T * T) / T;
+  return h0 + vy0 * t - 0.5 * G * t * t;
+}
+
+/** 同じ放物線の t 秒後の上向きの速さ */
+export function ballisticVy(h0: number, h1: number, t: number, T: number): number {
+  return (h1 - h0 + 0.5 * G * T * T) / T - G * t;
+}
+
+/** ロブの水平の速さの上限: 頂点がリリース点と受け手を結ぶ線より 0.6+0.12·L 上になる（重力でその高さまで上がる）飛行時間から */
+export function lobSpeed(L: number): number {
   const apex = 0.6 + 0.12 * L;
-  return lerp(h0, h1, s) + 4 * apex * s * (1 - s);
+  return L / Math.sqrt((8 * apex) / G);
 }
 
 function newLane(kind: LaneKind, from: Player, to: Player | null, pts: V2[], target: V2): Lane {
@@ -96,14 +143,27 @@ export function styleParams(passer: Player, style: PassStyle, endH = 1.5): Style
   }
 }
 
-/** バウンズパスが床に着く位置（飛行の割合） */
+/** バウンズパスが床に着く時刻（飛行時間の割合） */
 export const BOUNCE_AT = 0.62;
 
-/** 飛行の割合 s でのボールの高さ */
-export function passHeight(style: PassStyle, h0: number, h1: number, s: number, L: number): number {
-  if (style === "lob") return lobHeight(h0, h1, s, L);
-  if (style === "bounce") return s < BOUNCE_AT ? lerp(h0, 0.12, s / BOUNCE_AT) : lerp(0.12, h1, (s - BOUNCE_AT) / (1 - BOUNCE_AT));
-  return lerp(h0, h1, s);
+/** 飛行時間の割合 u でのボールの高さ（T = 飛行時間）。バウンズは床までと床からの2つの放物線 */
+export function passHeight(style: PassStyle, h0: number, h1: number, u: number, T: number): number {
+  const t = clamp(u, 0, 1) * T;
+  if (style === "bounce") {
+    const tb = BOUNCE_AT * T;
+    return t < tb ? ballistic(h0, 0.12, t, tb) : ballistic(0.12, h1, t - tb, T - tb);
+  }
+  return ballistic(h0, h1, t, T);
+}
+
+/** 飛行時間の割合 u でのボールの上向きの速さ */
+export function passVy(style: PassStyle, h0: number, h1: number, u: number, T: number): number {
+  const t = clamp(u, 0, 1) * T;
+  if (style === "bounce") {
+    const tb = BOUNCE_AT * T;
+    return t < tb ? ballisticVy(h0, 0.12, t, tb) : ballisticVy(0.12, h1, t - tb, T - tb);
+  }
+  return ballisticVy(h0, h1, t, T);
 }
 
 /** リリース点。side=±1 で左右どちらかの手から（目の前の守備者の手をよけて出す） */
@@ -122,6 +182,10 @@ export function passLane(c: LaneCtx, passer: Player, recv: Player, target: V2, s
   const sp = styleParams(passer, style, endH);
   const p0 = releasePoint(passer, target, side);
   const L = Math.max(0.1, dist(p0, target));
+  // ロブは重力で山なりになる速さまで（速く投げると低く飛ぶ）
+  if (style === "lob") sp.speed = Math.min(sp.speed, lobSpeed(L));
+  // パスは上半身の前から真横までしか出せない: 上半身をひねる（足りなければ足も回す）時間ぶん構えが長い
+  sp.rel += passer.passTurnTime(dirTo(passer.p, target));
   const lane = newLane(style === "lob" ? "lob" : "pass", passer, recv, [p0, target], target);
   lane.style = style;
   lane.side = side;
@@ -133,14 +197,23 @@ export function passLane(c: LaneCtx, passer: Player, recv: Player, target: V2, s
   return lane;
 }
 
-/** 種類と左右の手を試して、いちばん開くパス */
+/**
+ * 速いパス（チェスト・バウンズ・オーバーヘッド・ジャンプ）を出せる最低の距離 [m]。
+ * これより近い相手には山なりのロブ（ゆっくりした柔らかいパス）しか出せない。
+ * バウンズは床で弾ませる距離が要るので少し長い。手渡し（forcePass）はこの制限を受けない。
+ */
+export const PASS_MIN_DIST: Record<PassStyle, number> = { chest: 3.0, overhead: 3.0, jump: 3.0, bounce: 3.5, lob: 0 };
+
+/** 種類と左右の手を試して、いちばん開くパス（近すぎる相手には速いパスを出せない＝ロブだけ） */
 export function bestPassLane(c: LaneCtx, passer: Player, recv: Player, target: V2, coarse = false): Lane {
+  const D = dist(passer.p, target);
   const tries: [PassStyle, number][] = coarse
     ? [["chest", 0], ["bounce", 0], ["overhead", 0], ["lob", 0]]
     : [["chest", 0], ["chest", 1], ["chest", -1], ["bounce", 0], ["bounce", 1], ["bounce", -1], ["overhead", 0], ["jump", 0], ["lob", 0]];
   let best: Lane | null = null;
   let fastest: Lane | null = null;
   for (const [st, sd] of tries) {
+    if (D < PASS_MIN_DIST[st]) continue;
     // 立っている相手へのロブは頭の上（1.9m）で受けさせる
     const l = passLane(c, passer, recv, target, st, sd, st === "lob" ? 1.9 : 1.5);
     // 十分空いている（0.85以上）なら、いちばん早く届くパス（チェスト/オーバーハンド）で早く通す
@@ -159,6 +232,7 @@ function scorePass(
   L: number, sp: StyleP, style: PassStyle, recvArrive: number,
 ): void {
   const s0 = Math.min(0.5, 0.6 / L);
+  const Tf = L / sp.speed;
   const obst: Obstacle[] = [{ p: recv.p, r: recv.radius, hold: 0.15 }, ...c.screens];
   let margin = 9;
   let closer: Player | null = null;
@@ -167,10 +241,11 @@ function scorePass(
     const lag = d.reactT * (1 - antic);
     const va = defAt(c, d);
     for (let i = 0; i <= 7; i++) {
-      const s = s0 + ((1 - s0) * i) / 7;
+      const s = s0 + ((1 - s0) * i) / 7; // 水平に進んだ割合
       if (style === "lob" && s < 0.55) continue;
+      const u = fracToU(s, L); // そこへ来る飛行時間の割合（空気抵抗で先ほど遅れる）
       // その点のボールの高さに、腕（跳べば跳躍ぶん／低ければかがんで）が届く水平距離
-      const ballH = passHeight(style, sp.h0, sp.h1, s, L);
+      const ballH = passHeight(style, sp.h0, sp.h1, u, Tf);
       let handR = d.handReachAt(ballH, true);
       let extra = 0;
       if (handR < 0 && ballH < d.shoulderY) { handR = d.handReachLow(ballH); extra = 0.15; }
@@ -179,7 +254,7 @@ function scorePass(
       // 受け手の手前ではレシーバーの体が手を遮る
       const reachR = s > 0.9 ? Math.min(handR, 0.6) : handR + LUNGE_REACH * 0.8;
       const td = timeToReach(d, X, reachR, { lag, obstacles: obst, ...va }) + extra;
-      const m = td - (sp.rel + (s * L) / sp.speed);
+      const m = td - (sp.rel + u * Tf);
       if (m < margin) { margin = m; closer = d; }
     }
   }
@@ -208,19 +283,26 @@ export function leadLane(c: LaneCtx, passer: Player, recv: Player, path: V2[], l
   if (total < 0.5) return null;
   const vr = recv.speedNow() * 0.95;
   const v0 = len(recv.v);
-  const styles: PassStyle[] = lob ? ["lob"] : ["chest", "bounce"];
+  // 走り込む先が近すぎれば速いパスは出せない → ロブ（ゆっくり）だけ
+  const styles: PassStyle[] = lob ? ["lob"] : ["chest", "bounce", "lob"];
   let best: Lane | null = null;
   for (const tau of [0.55, 0.8, 1.05, 1.35, 1.7]) {
     const dRun = Math.min(total, runDist(tau, v0, vr, recv.accelMax));
     const R = alongPoly(path, dRun);
+    const turn = passer.passTurnTime(dirTo(passer.p, R));
     for (const style of styles) {
+      const Dr = dist(passer.p, R);
+      if (Dr < PASS_MIN_DIST[style]) continue;
+      // アリウープでないリードのロブは、速いパスが出せない近さのときだけ
+      if (!lob && style === "lob" && Dr >= PASS_MIN_DIST.chest) continue;
       const sp = styleParams(passer, style, endH);
+      sp.rel += turn;
       if (tau - sp.rel < 0.15) continue;
       const p0 = releasePoint(passer, R, 0);
       const L = Math.max(0.1, dist(p0, R));
       let vb = L / (tau - sp.rel);
-      if (vb > sp.speed) continue;
-      const vmin = lob ? 4.5 : sp.speed * 0.55;
+      if (vb > sp.speed || (style === "lob" && vb > lobSpeed(L))) continue;
+      const vmin = style === "lob" ? Math.min(4.5, lobSpeed(L)) : sp.speed * 0.55;
       if (vb < vmin) vb = vmin;
       const spv: StyleP = { ...sp, speed: vb };
       const lane = newLane(lob ? "lob" : "lead", passer, recv, [p0, R], R);
@@ -274,6 +356,58 @@ export function driveLane(c: LaneCtx, h: Player, path: V2[], t0 = 0, v0in?: numb
   lane.open = openOf(margin);
   lane.closer = closer;
   lane.freeD = freeD;
+  return lane;
+}
+
+/**
+ * ステップ導線（サイドステップ／ステップバック）の表示と開き。from→to へ T 秒でステップし、
+ * 開き・消している守備者は着地してからの狙い（follow = シュート導線 or 突破の導線）のものを使う。
+ */
+export function stepLane(h: Player, from: V2, to: V2, T: number, follow: Lane): Lane {
+  const lane = newLane("step", h, null, [from, to], to);
+  lane.T = T;
+  lane.margin = follow.margin;
+  lane.open = follow.open;
+  lane.closer = follow.closer;
+  return lane;
+}
+
+/**
+ * 押し込みドリブルの導線（ポストアップ）。ゴールに背を向け、マーク d を背中で押してゴール下（リムの手前1.3m）まで進む。
+ * 進む速さは押し合いの物理（contact.ts）と同じ式: 押し勝ちの度合い net = (押す力h − 押す力d)/(和)、速さ = net × POST_PUSH_SPEED。
+ * 構えは押し込む側0.9（仕掛ける有利つき）・守る側0.8で見積もる。ドリブルの上手さは使わない（体でボールを守るので取られにくい）。
+ *   lane.open   = 押し進める度合い（速さ 0.6m/s で 1）。押し負けていれば 0（進めない・押し戻される）
+ *   lane.margin = ゴール下に着く時刻までに、マーク以外の守備者（ヘルプ）がゴール下へ寄れる余裕（決めの難しさに使う）
+ *   lane.speed  = 進む速さ（負なら押し戻される）、lane.T = 着いて振り向くまでの時間
+ */
+export function postLane(c: LaneCtx, h: Player, d: Player): Lane {
+  const toRim = dirTo(h.p, RIM);
+  const fin = madd(RIM, dirTo(RIM, h.p), 1.3);
+  const lane = newLane("post", h, null, [h.p, fin], fin);
+  const Fa = pushPower(h, 0.9, true), Fb = pushPower(d, 0.8, false);
+  const net = (Fa - Fb) / (Fa + Fb);
+  const v = net * POST_PUSH_SPEED;
+  lane.speed = v;
+  lane.closer = d;
+  const D = Math.max(0, dist(h.p, fin));
+  // マークがリングとの間に居なければ押し込みにならない（T<0 = 使えない）
+  if (dot(toRim, dirTo(h.p, d.p)) < 0.2) {
+    lane.margin = -1;
+    lane.open = 0;
+    lane.T = -1;
+    return lane;
+  }
+  // 押し進められない（互角以下）ときも試すことはできる（open 0、着くまでの時間は長い見込み）
+  lane.T = D / Math.max(0.15, v) + 0.3; // 押し込む時間＋振り向いて打つまで
+  let margin = 9;
+  for (const x of c.defs) {
+    if (x === d) continue;
+    const m = timeToReach(x, fin, 0.9, { lag: x.reactT, ...defAt(c, x) }) - lane.T;
+    if (m < margin) { margin = m; lane.closer = x; }
+  }
+  lane.margin = margin;
+  lane.open = sat(v / 0.6);
+  lane.freeD = D;
   return lane;
 }
 

@@ -1,11 +1,26 @@
 // ハンドラーの選択肢を導線で評価する。攻撃の判断と守備の最適化（脅威の評価）が同じ関数を使う。
-import { RIM, distRim, inCourt } from "./court";
+import { n } from "./attrs";
+import { COURT, RIM, distRim, inCourt, isThree } from "./court";
+import { MOVES, MoveId, moveDisp } from "./duel";
 import { creatorK, finishPoint, holdValue, releaseTime, shotEV, pMake, shotBase } from "./eval";
-import { Lane, LaneCtx, bestPassLane, driveLane, leadLane, shotLane } from "./lanes";
+import { Lane, LaneCtx, bestPassLane, driveLane, leadLane, openOf, postLane, shotLane, stepLane } from "./lanes";
+import { POST_PUSH_SPEED } from "./contact";
 import { V2, dirTo, dist, dot, lerpV, madd, right, rot, sub } from "./math";
 import { Player } from "./player";
 
-export type OptKind = "shoot" | "pass" | "lead" | "lob" | "drive" | "hold";
+export type OptKind = "shoot" | "pass" | "lead" | "lob" | "drive" | "step" | "post" | "hold";
+
+/** ステップ導線: どのムーブで、どこへ出て、そのあと何をする見込みか */
+export interface StepPlan {
+  id: MoveId;
+  s: number;
+  /** 着地点 */
+  at: V2;
+  /** 着地してからの狙い（シュート／そこから突破） */
+  follow: "shoot" | "drive";
+  /** 突破のときの経路 */
+  drivePath: V2[] | null;
+}
 
 export interface Option {
   kind: OptKind;
@@ -16,6 +31,8 @@ export interface Option {
   after: Lane | null;
   /** ドライブの経路 */
   path: V2[] | null;
+  /** ステップ導線の中身（kind="step" のときだけ） */
+  step?: StepPlan;
 }
 
 export interface CutInfo {
@@ -39,6 +56,8 @@ export interface OptCtx {
   coarse?: boolean;
   /** ハンドラーがボールを持ち続けている時間 */
   holdT?: number;
+  /** ショットクロックの残り（押し込みなど時間のかかる選択肢の可否） */
+  shotClock?: number;
 }
 
 /**
@@ -96,6 +115,24 @@ export function evalOptions(o: OptCtx): Option[] {
     const v = C + (layEV(dl.open) - C) * dl.open + collapse * (1 - dl.open);
     out.push({ kind: "drive", value: v, lane: dl, to: null, after: null, path });
   }
+
+  // 押し込みドリブル（ペイント付近でマークを背中で押してゴール下へ）
+  if (o.onBall && distRim(h.p) < 6.0 && distRim(h.p) > 1.8 && dist(o.onBall.p, h.p) < 1.6) {
+    const pl = postLane(lc, h, o.onBall);
+    // マークがリングとの間に居るとき（力で負けていても試せる。進めなければ実行中に見切る）
+    if (pl.T >= 0) {
+      const fin = pl.target;
+      // ゴール下での決め: マークは背中に居るが押し勝っているほど体勢が良い。ヘルプが寄れるほど難しい
+      const net = pl.speed / POST_PUSH_SPEED;
+      const help = openOf(pl.margin);
+      const finOpen = Math.min(0.85, Math.max(0.1, 0.3 + 3 * net)) * (0.4 + 0.6 * help);
+      const ev = pMake(h, fin, finOpen) * 2;
+      out.push({ kind: "post", value: C + (ev - C) * (0.5 + 0.5 * pl.open), lane: pl, to: null, after: null, path: [h.p, fin] });
+    }
+  }
+
+  // ステップ（左右のサイドステップ・ステップバック）→ シュート、またはそれを見せて突破
+  if (!o.coarse && o.onBall) out.push(...stepOptions(o, layEV));
 
   // パス（キャッチ後のシュート導線＝クローズアウトの競争まで含める）
   for (const m of o.mates) {
@@ -164,3 +201,47 @@ export function receiveValue(lc: LaneCtx, h: Player, m: Player, c: V2): number {
   return v;
 }
 
+
+/**
+ * ステップ導線（左右のサイドステップ・ステップバック）。マークとの間合いを横・後ろへずらして、
+ *   ① 着地してシュート: 着地点からのシュート導線（ステップの時間 tStep のあいだに守備者が手を届かせられるか）
+ *   ② 着地してから突破: 撃つ構えを見せるので、信じた守備者は詰めて出遅れる（フェイクの効きぶん走り出しが早い）
+ * の良い方を価値にする。シュートが届かない距離でも、ずらした位置からの突破の導線が開けば選ばれる。
+ */
+function stepOptions(o: OptCtx, layEV: (open: number) => number): Option[] {
+  const { lc, h, C } = o;
+  const od = o.onBall!;
+  const out: Option[] = [];
+  const axis = dirTo(h.p, RIM);
+  const lat = right(axis);
+  // フェイクの効き: その位置で撃てると思わせる力 × 守備者の掛かりやすさ
+  const gull = 1 - 0.6 * n(od.a.defIQ);
+  const tries: [MoveId, number][] = [["sidestep", 1], ["sidestep", -1], ["stepback", h.hand >= 0 ? 1 : -1]];
+  for (const [id, sd] of tries) {
+    const [fw, lt] = moveDisp(h, id, sd);
+    const at = madd(madd(h.p, axis, fw), lat, lt);
+    // ライン際・バックコート・ゴール下へは出ない
+    if (Math.abs(at.x) > COURT.halfW - 0.6 || at.z > COURT.baseZ - 0.6 || at.z < 0.8 || distRim(at) < 2.0) continue;
+    const def = MOVES[id];
+    const tStep = def.dur;
+    // ① 着地してシュート（ステップからのシュートは体勢が少し難しい）
+    const sl = shotLane(lc, h, at, tStep, releaseTime(h, at, false));
+    const evShot = shotEV(h, at, sl.open) * 0.93;
+    // ② 着地してから突破
+    const believe = isThree(at) ? n(h.a.three) : n(h.a.mid);
+    const fakeGain = 0.18 * believe * gull;
+    const dpath = [at, finishPoint(at)];
+    const dl = driveLane(lc, h, dpath, Math.max(0, tStep - fakeGain), 0);
+    const evDrive = C + (layEV(dl.open) - C) * dl.open;
+    const follow = evShot >= evDrive ? "shoot" : "drive";
+    const fl = follow === "shoot" ? sl : dl;
+    // ムーブのしくじり（ハンドリングが足りない）と、ステップに使う時間のぶん
+    const risk = Math.max(0, def.diff - n(h.a.handle)) * 0.25;
+    const v = Math.max(evShot, evDrive) * (1 - risk) - 0.02;
+    out.push({
+      kind: "step", value: v, lane: stepLane(h, h.p, at, tStep, fl), to: null, after: fl, path: null,
+      step: { id, s: sd, at, follow, drivePath: follow === "drive" ? dpath : null },
+    });
+  }
+  return out;
+}
